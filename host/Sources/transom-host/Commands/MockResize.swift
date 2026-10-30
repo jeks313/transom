@@ -57,7 +57,7 @@ struct MockResize: AsyncParsableCommand {
                 // Lane 0's display; the clamp check below assumes one lane.
                 vds = lanes.first?.vdsSize
                 remainingLayouts = lanes.count
-            case let .windowCreated(id, lane, rect, _, _) where lane == 0:
+            case let .windowCreated(id, lane, _, rect, _, _) where lane == 0:
                 windows.append((id, rect))
             case .tileLayout:
                 remainingLayouts -= 1

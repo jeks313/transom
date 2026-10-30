@@ -1,3 +1,4 @@
+import ApplicationServices
 import Foundation
 
 /// The control channel server (issue #3 Phase 3): one TCP client at a time,
@@ -26,6 +27,8 @@ public actor ControlServer {
     }
 
     private let lanes: [Lane]
+    /// The newest menu bar of each app, replayed after every resync.
+    private var menuBars: [UInt32: [MenuItem]] = [:]
     private var active: (id: UUID, transport: any PacketTransport)?
     private var stopped = false
 
@@ -79,13 +82,50 @@ public actor ControlServer {
     /// registry, so nothing is left half-described.
     public func broadcast(_ event: WindowWatcher.WindowEvent, lane: UInt32 = 0) async {
         guard let active else { return }
+        var app: UInt32 = 0
+        if case .created(let id, _, _) = event, let registry = registry(of: id) {
+            app = Self.app(of: id, in: registry)
+        }
         do {
             try await active.transport.send(
-                try WireCodec.encode(Self.message(for: event, lane: lane)))
+                try WireCodec.encode(Self.message(for: event, lane: lane, app: app)))
         } catch {
             Log.general.notice(
                 "control: send failed, dropping client: \(error.localizedDescription, privacy: .public)"
             )
+            if self.active?.id == active.id {
+                self.active = nil
+                onConnectionChange?(false)
+            }
+            await active.transport.close()
+        }
+    }
+
+    /// Record `app`'s menu bar and send it if it changed.
+    public func setMenuBar(app: UInt32, menus: [MenuItem]) async {
+        guard menuBars[app] != menus else { return }
+        menuBars[app] = menus
+        await send(.menuBar(app: app, menus: menus))
+    }
+
+    /// The opaque app token of a window: its owner's process id.
+    static func app(of id: UInt64, in registry: WindowRegistry) -> UInt32 {
+        guard let element = registry.element(for: id) else { return 0 }
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        return UInt32(bitPattern: pid)
+    }
+
+    /// The registry that knows window `id`, among every lane's.
+    private func registry(of id: UInt64) -> WindowRegistry? {
+        lanes.first { $0.registry.element(for: id) != nil }?.registry
+    }
+
+    private func send(_ message: ControlMessage) async {
+        guard let active else { return }
+        do {
+            try await active.transport.send(try WireCodec.encode(message))
+        } catch {
             if self.active?.id == active.id {
                 self.active = nil
                 onConnectionChange?(false)
@@ -153,24 +193,28 @@ public actor ControlServer {
                 try await transport.send(
                     try WireCodec.encode(
                         .windowCreated(
-                            id: entry.id, lane: lane.id, rect: entry.rect, title: entry.title,
-                            kind: .normal)))
+                            id: entry.id, lane: lane.id, app: Self.app(of: entry.id, in: lane.registry),
+                            rect: entry.rect, title: entry.title, kind: .normal)))
             }
             let windows = entries.map { WireWindow(id: $0.id, rect: $0.rect) }
             try await transport.send(
                 try WireCodec.encode(
                     .tileLayout(lane: lane.id, windows: windows, displaySize: lane.vdsSize)))
         }
+        for (app, menus) in menuBars.sorted(by: { $0.key < $1.key }) {
+            try await transport.send(try WireCodec.encode(.menuBar(app: app, menus: menus)))
+        }
     }
 
-    private static func message(for event: WindowWatcher.WindowEvent, lane: UInt32)
+    private static func message(for event: WindowWatcher.WindowEvent, lane: UInt32, app: UInt32)
         -> ControlMessage
     {
         switch event {
         case .sharingFailed(let message):
             return .error(code: 2, message: message)
         case .created(let id, let rect, let title):
-            return .windowCreated(id: id, lane: lane, rect: rect, title: title, kind: .normal)
+            return .windowCreated(
+                id: id, lane: lane, app: app, rect: rect, title: title, kind: .normal)
         case .moved(let id, let rect):
             return .windowMoved(id: id, rect: rect)
         case .destroyed(let id):

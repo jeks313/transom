@@ -77,6 +77,19 @@ pub struct Lane {
     pub vds: Size,
 }
 
+/// One item of an app's menu bar (protocol.md §4 `menuBar`). A separator has
+/// `separator` set; a submenu has `items`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    pub title: String,
+    pub enabled: bool,
+    pub checked: bool,
+    /// Shortcut in this keyboard's terms ("Ctrl+Shift+N"), "" for none.
+    pub shortcut: String,
+    pub separator: bool,
+    pub items: Vec<MenuItem>,
+}
+
 /// One window's id + rect, as carried in a `tileLayout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileWindow {
@@ -98,6 +111,8 @@ pub enum ServerMessage {
     WindowCreated {
         id: u64,
         lane: u32,
+        /// The app that owns the window: the key of its `MenuBar`.
+        app: u32,
         rect: Rect,
         title: String,
         kind: WindowKind,
@@ -125,6 +140,11 @@ pub enum ServerMessage {
     Error {
         code: u32,
         message: String,
+    },
+    /// `app`'s menu bar, the Apple menu left out: the first menu's path index is 1.
+    MenuBar {
+        app: u32,
+        menus: Vec<MenuItem>,
     },
 }
 
@@ -154,6 +174,17 @@ pub enum ClientMessage {
         event: InputEvent,
         /// Client's monotonic timestamp in milliseconds; opaque to the host in v1.
         ts: u64,
+    },
+    /// Choose the menu item at `path` of window `id`'s app; pressed only if its
+    /// title is still `title`.
+    MenuPick {
+        id: u64,
+        path: Vec<u32>,
+        title: String,
+    },
+    /// A menu of window `id`'s app is opening: send its menu bar again.
+    MenuRefresh {
+        id: u64,
     },
 }
 
@@ -218,6 +249,35 @@ fn rect_field(obj: &Value, key: &str) -> Result<Rect, DecodeError> {
     })
 }
 
+fn bool_field(obj: &Value, key: &str) -> Result<bool, DecodeError> {
+    match field(obj, key)? {
+        Value::Bool(b) => Ok(*b),
+        _ => Err(DecodeError::Shape(format!("field `{key}` is not a bool"))),
+    }
+}
+
+fn menu_items(obj: &Value, key: &str, depth: usize) -> Result<Vec<MenuItem>, DecodeError> {
+    // The host sends at most four levels; anything deeper is not a menu bar.
+    if depth > 8 {
+        return Err(DecodeError::Shape("menu nested too deeply".to_string()));
+    }
+    let arr = field(obj, key)?
+        .as_array()
+        .ok_or_else(|| DecodeError::Shape(format!("`{key}` is not an array")))?;
+    arr.iter()
+        .map(|m| {
+            Ok(MenuItem {
+                title: str_field(m, "title")?,
+                enabled: bool_field(m, "enabled")?,
+                checked: bool_field(m, "checked")?,
+                shortcut: str_field(m, "shortcut")?,
+                separator: bool_field(m, "separator")?,
+                items: menu_items(m, "items", depth + 1)?,
+            })
+        })
+        .collect()
+}
+
 fn size_field(obj: &Value, key: &str) -> Result<Size, DecodeError> {
     let s = field(obj, key)?;
     Ok(Size {
@@ -261,6 +321,7 @@ impl ServerMessage {
             "windowCreated" => Ok(ServerMessage::WindowCreated {
                 id: u64_field(&v, "id")?,
                 lane: u32_field(&v, "lane")?,
+                app: u32_field(&v, "app")?,
                 rect: rect_field(&v, "rect")?,
                 title: str_field(&v, "title")?,
                 kind: WindowKind::from_wire(field(&v, "kind")?.as_str().unwrap_or("normal")),
@@ -299,6 +360,10 @@ impl ServerMessage {
             "error" => Ok(ServerMessage::Error {
                 code: u32_field(&v, "code")?,
                 message: str_field(&v, "message")?,
+            }),
+            "menuBar" => Ok(ServerMessage::MenuBar {
+                app: u32_field(&v, "app")?,
+                menus: menu_items(&v, "menus", 0)?,
             }),
             other => Err(DecodeError::Shape(format!(
                 "unknown control message type `{other}`"
@@ -343,6 +408,19 @@ impl ClientMessage {
                 ("id", Value::uint(*id)),
                 ("event", event.to_value()),
                 ("ts", Value::uint(*ts)),
+            ]),
+            ClientMessage::MenuPick { id, path, title } => Value::object(vec![
+                ("type", Value::str("menuPick")),
+                ("id", Value::uint(*id)),
+                (
+                    "path",
+                    Value::Array(path.iter().map(|i| Value::uint(*i as u64)).collect()),
+                ),
+                ("title", Value::str(title.clone())),
+            ]),
+            ClientMessage::MenuRefresh { id } => Value::object(vec![
+                ("type", Value::str("menuRefresh")),
+                ("id", Value::uint(*id)),
             ]),
         }
     }
@@ -421,7 +499,7 @@ mod tests {
     #[test]
     fn decodes_window_created_with_kind_and_unicode_title() {
         let msg = ServerMessage::decode(
-            r#"{"type":"windowCreated","id":42,"lane":3,"rect":{"x":0,"y":0,"w":800,"h":600},"title":"café — Xcode","kind":"normal"}"#
+            r#"{"type":"windowCreated","id":42,"lane":3,"app":77,"rect":{"x":0,"y":0,"w":800,"h":600},"title":"café — Xcode","kind":"normal"}"#
                 .as_bytes(),
         )
         .unwrap();
@@ -445,7 +523,7 @@ mod tests {
     #[test]
     fn unknown_kind_falls_back_to_normal() {
         let msg = ServerMessage::decode(
-            br#"{"type":"windowCreated","id":1,"lane":0,"rect":{"x":0,"y":0,"w":1,"h":1},"title":"","kind":"future"}"#,
+            br#"{"type":"windowCreated","id":1,"lane":0,"app":1,"rect":{"x":0,"y":0,"w":1,"h":1},"title":"","kind":"future"}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -477,6 +555,39 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_menu_bar_as_the_host_encodes_it() {
+        let msg = ServerMessage::decode(
+            br#"{"type":"menuBar","app":7,"menus":[{"title":"File","enabled":true,"checked":false,"shortcut":"","separator":false,"items":[{"title":"New Window","enabled":true,"checked":false,"shortcut":"Ctrl+N","separator":false,"items":[]},{"title":"","enabled":false,"checked":false,"shortcut":"","separator":true,"items":[]}]}]}"#,
+        )
+        .unwrap();
+        let ServerMessage::MenuBar { app, menus } = msg else {
+            panic!("wrong variant");
+        };
+        assert_eq!(app, 7);
+        assert_eq!(menus[0].title, "File");
+        assert_eq!(menus[0].items[0].shortcut, "Ctrl+N");
+        assert!(menus[0].items[1].separator);
+    }
+
+    #[test]
+    fn encodes_menu_pick_and_refresh() {
+        assert_eq!(
+            ClientMessage::MenuPick {
+                id: 3,
+                path: vec![2, 0],
+                title: "New Window".into()
+            }
+            .to_value()
+            .to_json(),
+            r#"{"type":"menuPick","id":3,"path":[2,0],"title":"New Window"}"#
+        );
+        assert_eq!(
+            ClientMessage::MenuRefresh { id: 3 }.to_value().to_json(),
+            r#"{"type":"menuRefresh","id":3}"#
+        );
     }
 
     #[test]

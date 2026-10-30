@@ -88,9 +88,11 @@ public enum ControlMessage: Sendable, Equatable {
     /// First message on a fresh control connection: version + every lane and its
     /// virtual display size, so the client can sanity-check every rect it receives.
     case hello(protocolVersion: Int, lanes: [WireLane])
-    /// `lane` says which display (and video stream) the window is on. Ids are
+    /// `lane` says which display (and video stream) the window is on, `app`
+    /// which app owns it (an opaque token, the key of its `menuBar`). Ids are
     /// unique across lanes, so later messages carry only the id.
-    case windowCreated(id: UInt64, lane: UInt32, rect: WireRect, title: String, kind: WindowKind)
+    case windowCreated(
+        id: UInt64, lane: UInt32, app: UInt32, rect: WireRect, title: String, kind: WindowKind)
     /// ACTUAL geometry after an AX write or an observed move (I-4), never requested.
     case windowMoved(id: UInt64, rect: WireRect)
     case windowDestroyed(id: UInt64)
@@ -98,6 +100,9 @@ public enum ControlMessage: Sendable, Equatable {
     case windowFocused(id: UInt64)
     case tileLayout(lane: UInt32, windows: [WireWindow], displaySize: WireSize)
     case error(code: UInt32, message: String)
+    /// The menu bar of `app` (the Apple menu left out), for every window it owns.
+    /// Sent after the resync and again whenever it changes.
+    case menuBar(app: UInt32, menus: [MenuItem])
 }
 
 // MARK: - Client -> Host
@@ -113,15 +118,21 @@ public enum ClientMessage: Sendable, Equatable {
     /// window-local physical pixels / Windows VK codes (see `InputEvent`); `ts` is
     /// the client's monotonic timestamp in milliseconds, opaque to the host in v1.
     case input(id: UInt64, event: InputEvent, ts: UInt64)
+    /// Choose the menu item at `path` (indices into the `menuBar`, the first
+    /// counting the Apple menu as 0) of the app that owns window `id`. `title`
+    /// is the item's title as shown; the host presses it only if it still has it.
+    case menuPick(id: UInt64, path: [UInt32], title: String)
+    /// A menu of window `id`'s app is opening: read the menu bar again.
+    case menuRefresh(id: UInt64)
 }
 
 // MARK: - Codable (explicit, cross-language JSON)
 
 extension ControlMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, lane, rect, title, kind, windows, displaySize
+        case type, id, lane, app, rect, title, kind, windows, displaySize
         case protocolVersion = "protocol"
-        case lanes, code, message
+        case lanes, code, message, menus
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -131,10 +142,11 @@ extension ControlMessage: Codable {
             try c.encode("hello", forKey: .type)
             try c.encode(version, forKey: .protocolVersion)
             try c.encode(lanes, forKey: .lanes)
-        case .windowCreated(let id, let lane, let rect, let title, let kind):
+        case .windowCreated(let id, let lane, let app, let rect, let title, let kind):
             try c.encode("windowCreated", forKey: .type)
             try c.encode(id, forKey: .id)
             try c.encode(lane, forKey: .lane)
+            try c.encode(app, forKey: .app)
             try c.encode(rect, forKey: .rect)
             try c.encode(title, forKey: .title)
             try c.encode(kind, forKey: .kind)
@@ -161,6 +173,10 @@ extension ControlMessage: Codable {
             try c.encode("error", forKey: .type)
             try c.encode(code, forKey: .code)
             try c.encode(message, forKey: .message)
+        case .menuBar(let app, let menus):
+            try c.encode("menuBar", forKey: .type)
+            try c.encode(app, forKey: .app)
+            try c.encode(menus, forKey: .menus)
         }
     }
 
@@ -176,6 +192,7 @@ extension ControlMessage: Codable {
             self = .windowCreated(
                 id: try c.decode(UInt64.self, forKey: .id),
                 lane: try c.decode(UInt32.self, forKey: .lane),
+                app: try c.decode(UInt32.self, forKey: .app),
                 rect: try c.decode(WireRect.self, forKey: .rect),
                 title: try c.decode(String.self, forKey: .title),
                 kind: try c.decode(WindowKind.self, forKey: .kind))
@@ -200,6 +217,10 @@ extension ControlMessage: Codable {
             self = .error(
                 code: try c.decode(UInt32.self, forKey: .code),
                 message: try c.decode(String.self, forKey: .message))
+        case "menuBar":
+            self = .menuBar(
+                app: try c.decode(UInt32.self, forKey: .app),
+                menus: try c.decode([MenuItem].self, forKey: .menus))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ControlMessage type \"\(type)\"")
@@ -209,7 +230,7 @@ extension ControlMessage: Codable {
 
 extension ClientMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, lane, size, phase, event, ts
+        case type, id, lane, size, phase, event, ts, path, title
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -234,6 +255,14 @@ extension ClientMessage: Codable {
             try c.encode(id, forKey: .id)
             try c.encode(event, forKey: .event)
             try c.encode(ts, forKey: .ts)
+        case .menuPick(let id, let path, let title):
+            try c.encode("menuPick", forKey: .type)
+            try c.encode(id, forKey: .id)
+            try c.encode(path, forKey: .path)
+            try c.encode(title, forKey: .title)
+        case .menuRefresh(let id):
+            try c.encode("menuRefresh", forKey: .type)
+            try c.encode(id, forKey: .id)
         }
     }
 
@@ -257,6 +286,13 @@ extension ClientMessage: Codable {
                 id: try c.decode(UInt64.self, forKey: .id),
                 event: try c.decode(InputEvent.self, forKey: .event),
                 ts: try c.decode(UInt64.self, forKey: .ts))
+        case "menuPick":
+            self = .menuPick(
+                id: try c.decode(UInt64.self, forKey: .id),
+                path: try c.decode([UInt32].self, forKey: .path),
+                title: try c.decode(String.self, forKey: .title))
+        case "menuRefresh":
+            self = .menuRefresh(id: try c.decode(UInt64.self, forKey: .id))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ClientMessage type \"\(type)\"")

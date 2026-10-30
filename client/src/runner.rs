@@ -31,6 +31,8 @@ struct Options {
     type_text: Option<String>,
     click: Option<(u64, u32, u32)>,
     resize: Option<(u64, u32, u32)>,
+    /// Window id, menu path and the item's title.
+    menu_pick: Option<(u64, Vec<u32>, String)>,
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -75,7 +77,10 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Actions that fire once, after the first window is known.
     let mut pending_actions =
-        opts.type_text.is_some() || opts.click.is_some() || opts.resize.is_some();
+        opts.type_text.is_some()
+            || opts.click.is_some()
+            || opts.resize.is_some()
+            || opts.menu_pick.is_some();
 
     let mut frames = 0u64;
     let mut video_bytes = 0u64;
@@ -249,6 +254,15 @@ fn print_control(ev: &ModelEvent, t: u64) {
         ModelEvent::HostError { code, message } => {
             println!("[{t:>6}ms] ! host error {code}: {message}")
         }
+        ModelEvent::MenuBar { app, menus } => {
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            println!(
+                "[{t:>6}ms] menu bar app {app}: {} ({} commands, {} enabled)",
+                titles.join(" | "),
+                crate::menu_plan::commands(menus).len(),
+                crate::menu_plan::commands(menus).iter().filter(|c| c.enabled).count()
+            )
+        }
     }
 }
 
@@ -294,6 +308,15 @@ fn maybe_run_actions(
         }
         let name = windows.get(&id).map(|e| e.0.as_str()).unwrap_or("?");
         println!("[{ts:>6}ms] -> requestResize {id} \"{name}\" to {w}x{h} (begin/live/end)");
+    }
+
+    if let Some((id, path, title)) = &opts.menu_pick {
+        let _ = session.send(&ClientMessage::MenuPick {
+            id: *id,
+            path: path.clone(),
+            title: title.clone(),
+        });
+        println!("[{ts:>6}ms] -> menuPick window {id} {path:?} \"{title}\"");
     }
 }
 
@@ -362,6 +385,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut type_text: Option<String> = None;
     let mut click: Option<(u64, u32, u32)> = None;
     let mut resize: Option<(u64, u32, u32)> = None;
+    let mut menu_pick: Option<(u64, Vec<u32>, String)> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -397,6 +421,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--resize" => {
                 resize = Some(parse_triple(&take(args, &mut i, "--resize")?, "--resize")?);
             }
+            "--menu-pick" => {
+                let v = take(args, &mut i, "--menu-pick")?;
+                let bad = || format!("--menu-pick wants id:path=title, like 4:4/0=Show Bar; got {v}");
+                let (head, title) = v.split_once('=').ok_or_else(bad)?;
+                let (id, path) = head.split_once(':').ok_or_else(bad)?;
+                let path: Result<Vec<u32>, _> = path.split('/').map(str::parse).collect();
+                menu_pick = Some((id.parse().map_err(|_| bad())?, path.map_err(|_| bad())?, title.into()));
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option {other}"));
             }
@@ -418,6 +450,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         type_text,
         click,
         resize,
+        menu_pick,
     })
 }
 
@@ -459,6 +492,7 @@ pub fn print_usage() {
          --type <text>        focus the first window and type <text> (US/ANSI keys)\n    \
          --click <id:x:y>     left-click window <id> at window-local pixel (x,y)\n    \
          --resize <id:w:h>    request a begin/live/end resize of window <id> to w x h\n\
+         --menu-pick <id:path=title>  choose a menu item of window <id>'s app\n\
          \n\
          EXAMPLE:\n    \
          transom-client connect 127.0.0.1 --control-port 47100 --seconds 5 --type hello"

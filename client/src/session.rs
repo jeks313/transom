@@ -364,7 +364,7 @@ mod tests {
             let mut bytes = crate::wire::frame::frame(
                 br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
             );
-            bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"lane":0,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
+            bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"lane":0,"app":1,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
             s.write_all(&bytes).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             assert_eq!(s.read(&mut [0; 1]).unwrap(), 0);

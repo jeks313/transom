@@ -164,7 +164,7 @@ struct MockClient: AsyncParsableCommand {
                 let sizes = lanes.map { "\($0.lane):\($0.vdsSize.w)x\($0.vdsSize.h)" }
                 print("mock-client: hello protocol=\(version) lanes=\(sizes.joined(separator: " "))")
                 remainingLayouts = lanes.count
-            case .windowCreated(let id, let lane, let rect, let title, _):
+            case .windowCreated(let id, let lane, _, let rect, let title, _):
                 windows[id] = rect
                 print("mock-client:   windowCreated id=\(id) lane=\(lane) \"\(title)\"")
             case .tileLayout(_, let ws, _):

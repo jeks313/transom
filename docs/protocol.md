@@ -153,14 +153,18 @@ reconnecting client gets the full resync again.
 
 ```
 hello          { protocol: 2, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
-windowCreated  { id: u64, lane: u32, rect: Rect, title: String, kind: WindowKind }
+windowCreated  { id: u64, lane: u32, app: u32, rect: Rect, title: String, kind: WindowKind }
 windowDestroyed{ id: u64 }
 windowMoved    { id: u64, rect: Rect }                  // ACTUAL geometry, see I-4
 windowTitle    { id: u64, title: String }
 windowFocused  { id: u64 }
 tileLayout     { lane: u32, windows: [{ id: u64, rect: Rect }], displaySize: Size }
 error          { code: u32, message: String }
+menuBar        { app: u32, menus: [MenuItem] }          // after resync, and on change
 ```
+
+`app` is an opaque token for the app that owns a window; `menuBar` carries that
+app's menu bar for all its windows. See **Menu bar** below.
 
 Concrete bytes on the wire (one framed control message):
 
@@ -187,6 +191,8 @@ requestResize  { id: u64, size: Size, phase: ResizePhase }
 requestFocus   { id: u64 }
 requestClose   { id: u64 }
 requestKeyframe{ lane?: u32 }                           // omitted lane = every lane
+menuPick       { id: u64, path: [u32], title: String }  // choose a menu item
+menuRefresh    { id: u64 }                              // a menu is opening
 input          { id: u64, event: InputEvent, ts: u64 }
 ```
 
@@ -301,6 +307,39 @@ follows the real cursor); dragging a window by its Mac title bar does nothing
 window forward; and a shared window that is **completely** covered may stop
 painting and handling input, because the app is told it is hidden — partial
 overlap is fine.
+
+### Menu bar
+
+The host reads each shared app's menu bar through Accessibility and the client
+shows it as a native menu bar on each of that app's windows.
+
+```
+MenuItem { title: String, enabled: bool, checked: bool, shortcut: String,
+           separator: bool, items: [MenuItem] }      // items empty = a leaf
+```
+
+- `menus` leaves out the Apple menu. A **path** is an item's indices among its
+  menus' children as read, counting the Apple menu as 0, so the first menu sent is
+  path index 1. Every child is sent (a non-item child as a disabled separator), so
+  indices stay aligned. The client may hide items: it shows only the first of
+  consecutive items with the same title (the Mac's Option-key alternates) and drops
+  stray separators.
+- `shortcut` is in the client's terms after the host's modifier map ("Ctrl+Shift+N"
+  for ⌘⇧N with the default swap), or "" when the client's keyboard cannot type it.
+  It is display text only: the client's key presses still go to the Mac as `input`.
+- `menuPick` names the window whose menu was used. The host makes that window key
+  in place, finds the item by path, and acts only if its title is still `title`:
+  it types the item's shortcut into the window when it has one, otherwise it presses
+  the item through AX. Typing is preferred because an app validates its menu against
+  its key window, and some (Chrome) disable window items while not frontmost, which
+  makes an AX press a no-op.
+- `enabled` and `checked` are as the app last validated them, which for a background
+  app can be stale or too disabled. The client sends `menuRefresh` when a menu opens
+  (at most once a second per app); the host reads the bar again and sends `menuBar`
+  if it changed. The client then updates states in place, or rebuilds the bar once
+  the open menu closes.
+- The keyboard's own menu activation (Alt, F10) is refused on proxy windows: Alt is
+  the Mac's Option key. Menus open with the mouse.
 
 ### Types
 

@@ -28,7 +28,7 @@ struct WireProtocolTests {
                     WireLane(lane: 1, vdsSize: WireSize(w: 4096, h: 2160)),
                 ]),
             .windowCreated(
-                id: 1, lane: 1, rect: WireRect(x: 0, y: 60, w: 1312, h: 844), title: "Xcode", kind: .normal),
+                id: 1, lane: 1, app: 4242, rect: WireRect(x: 0, y: 60, w: 1312, h: 844), title: "Xcode", kind: .normal),
             .windowMoved(id: 1, rect: WireRect(x: 1512, y: 60, w: 1312, h: 844)),
             .windowDestroyed(id: 7),
             .windowTitle(id: 1, title: "main.swift — edited"),
@@ -40,6 +40,17 @@ struct WireProtocolTests {
                     WireWindow(id: 2, rect: WireRect(x: 300, y: 60, w: 100, h: 100)),
                 ], displaySize: WireSize(w: 3840, h: 2160)),
             .error(code: 42, message: "does not fit"),
+            .menuBar(
+                app: 4242,
+                menus: [
+                    MenuItem(
+                        title: "File",
+                        items: [
+                            MenuItem(title: "New Window", shortcut: "Ctrl+N"),
+                            .separatorItem,
+                            MenuItem(title: "Close", enabled: false, checked: true),
+                        ])
+                ]),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)
@@ -61,6 +72,8 @@ struct WireProtocolTests {
             .input(id: 7, event: .scroll(x: 10, y: 20, dx: -3, dy: 5), ts: 1003),
             .input(id: 7, event: .keyDown(vk: 0x41), ts: 1004),
             .input(id: 7, event: .keyUp(vk: 0x41), ts: 1005),
+            .menuPick(id: 7, path: [2, 0], title: "New Window"),
+            .menuRefresh(id: 7),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)
@@ -129,9 +142,10 @@ struct WireProtocolTests {
             try JSONSerialization.jsonObject(
                 with: WireCodec.encode(
                     .windowCreated(
-                        id: 4, lane: 3, rect: WireRect(x: 0, y: 0, w: 1, h: 1), title: "t",
+                        id: 4, lane: 3, app: 9, rect: WireRect(x: 0, y: 0, w: 1, h: 1), title: "t",
                         kind: .normal))) as? [String: Any])
         #expect(created["lane"] as? Int == 3)
+        #expect(created["app"] as? Int == 9)
     }
 
     @Test("a requestKeyframe with no lane means every lane")

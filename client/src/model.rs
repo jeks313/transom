@@ -13,7 +13,7 @@
 //!  * The host reports **actual** geometry (I-4); the model just stores what it is
 //!    told and never assumes a requested size took effect.
 
-use crate::wire::{Lane, Rect, ServerMessage, Size, WindowKind};
+use crate::wire::{Lane, MenuItem, Rect, ServerMessage, Size, WindowKind};
 
 /// One managed window. `source` is its crop in its lane's texture; its `w`/`h`
 /// are also exactly the pixel size the native proxy window's client area must be,
@@ -23,6 +23,8 @@ pub struct Window {
     pub id: u64,
     /// The display (and video stream) the window is on.
     pub lane: u32,
+    /// The app that owns it: the key of its menu bar.
+    pub app: u32,
     pub source: Rect,
     pub title: String,
     pub kind: WindowKind,
@@ -64,6 +66,11 @@ pub enum ModelEvent {
     /// prune proxies that died while it was away.
     Resynced {
         removed: Vec<u64>,
+    },
+    /// An app's menu bar arrived or changed.
+    MenuBar {
+        app: u32,
+        menus: Vec<MenuItem>,
     },
     /// The host sent an `error`. Surfaced for logging; not fatal on its own.
     HostError {
@@ -125,6 +132,7 @@ impl WindowModel {
             ServerMessage::WindowCreated {
                 id,
                 lane,
+                app,
                 rect,
                 title,
                 kind,
@@ -132,6 +140,7 @@ impl WindowModel {
                 let window = Window {
                     id,
                     lane,
+                    app,
                     source: rect,
                     title: title.clone(),
                     kind,
@@ -227,6 +236,7 @@ impl WindowModel {
                         let window = Window {
                             id: tw.id,
                             lane,
+                            app: 0,
                             source: tw.rect,
                             title: String::new(),
                             kind: WindowKind::Normal,
@@ -261,6 +271,7 @@ impl WindowModel {
             ServerMessage::Error { code, message } => {
                 vec![ModelEvent::HostError { code, message }]
             }
+            ServerMessage::MenuBar { app, menus } => vec![ModelEvent::MenuBar { app, menus }],
         }
     }
 }
@@ -278,6 +289,7 @@ mod tests {
         ServerMessage::WindowCreated {
             id,
             lane: 0,
+            app: 1,
             rect: r,
             title: title.to_string(),
             kind: WindowKind::Normal,
@@ -455,6 +467,7 @@ mod tests {
         m.apply(ServerMessage::WindowCreated {
             id: 2,
             lane: 1,
+            app: 2,
             rect: rect(0, 0, 10, 10),
             title: "lane 1".to_string(),
             kind: WindowKind::Normal,

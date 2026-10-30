@@ -96,13 +96,13 @@ struct ServerShutdownTests {
                         WireLane(lane: 1, vdsSize: WireSize(w: 200, h: 100)),
                     ]),
                 .windowCreated(
-                    id: 1, lane: 0, rect: WireRect(x: 0, y: 0, w: 10, h: 10), title: "a",
+                    id: 1, lane: 0, app: 0, rect: WireRect(x: 0, y: 0, w: 10, h: 10), title: "a",
                     kind: .normal),
                 .tileLayout(
                     lane: 0, windows: [WireWindow(id: 1, rect: WireRect(x: 0, y: 0, w: 10, h: 10))],
                     displaySize: WireSize(w: 100, h: 100)),
                 .windowCreated(
-                    id: 2, lane: 1, rect: WireRect(x: 5, y: 5, w: 20, h: 20), title: "b",
+                    id: 2, lane: 1, app: 0, rect: WireRect(x: 5, y: 5, w: 20, h: 20), title: "b",
                     kind: .normal),
                 .tileLayout(
                     lane: 1, windows: [WireWindow(id: 2, rect: WireRect(x: 5, y: 5, w: 20, h: 20))],

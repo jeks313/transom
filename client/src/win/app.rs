@@ -10,7 +10,7 @@
 //! `DispatchMessageW`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
@@ -30,6 +30,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCCREATE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SIZING,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetMenu, SC_KEYMENU, WM_COMMAND, WM_ENTERMENULOOP, WM_EXITMENULOOP, WM_INITMENUPOPUP,
+    WM_SYSCOMMAND,
+};
 
 use super::connect::{Action, Dashboard};
 use super::gpu::{Gpu, SourceTexture};
@@ -37,10 +41,11 @@ use crate::connections::Connection;
 use std::sync::mpsc::{self, Receiver};
 type ConnectResult = Result<(Connection, Session, Receiver<SessionEvent>), String>;
 use super::input;
+use super::menu::MenuBar;
 use super::proxy::Proxy;
 use crate::model::{ModelEvent, Window};
 use crate::session::{Session, SessionEvent, VideoEvent};
-use crate::wire::{ClientMessage, InputEvent, Rect, ResizePhase, Size};
+use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, IsIconic, IsWindowVisible, KillTimer, SetForegroundWindow, SetTimer, SW_HIDE,
@@ -95,6 +100,14 @@ pub struct App {
     /// One video pipeline per lane (protocol v2): its display size, the texture
     /// its windows sample from, and its decoder.
     lanes: HashMap<u32, LaneVideo>,
+    /// Each app's newest menu bar, and the native bar built from it per proxy.
+    menus: HashMap<u32, Vec<MenuItem>>,
+    menu_bars: HashMap<u64, MenuBar>,
+    /// A native menu is open: bars whose items changed wait for it to close.
+    in_menu_loop: bool,
+    menus_stale: HashSet<u32>,
+    /// When each app's menu bar was last asked for again, to ask once a second.
+    menu_refreshed: HashMap<u32, Instant>,
     cascade: u32,
     /// Latest unsent hover move per proxy. High-polling-rate mice can emit far
     /// more messages than the control channel or Mac cursor needs; one per pump
@@ -161,6 +174,11 @@ impl App {
             windows: HashMap::new(),
             hwnd_to_id: HashMap::new(),
             lanes: HashMap::new(),
+            menus: HashMap::new(),
+            menu_bars: HashMap::new(),
+            in_menu_loop: false,
+            menus_stale: HashSet::new(),
+            menu_refreshed: HashMap::new(),
             cascade: 0,
             pending_mouse_moves: HashMap::new(),
             reconnect_at: None,
@@ -310,6 +328,9 @@ impl App {
         }
         self.rx = None;
         self.lanes.clear();
+        self.menus.clear();
+        self.menus_stale.clear();
+        self.menu_refreshed.clear();
         self.notice = None;
         self.video_notice = None;
         let ids: Vec<_> = self.proxies.keys().copied().collect();
@@ -464,6 +485,19 @@ impl App {
             ModelEvent::HostError { code, message } => {
                 self.notice = Some(format!("Host error {code}: {message}"));
             }
+            ModelEvent::MenuBar { app, menus } => {
+                self.menus.insert(app, menus);
+                let ids: Vec<u64> = self
+                    .proxies
+                    .keys()
+                    .copied()
+                    .filter(|id| self.windows.get(id).map(|w| w.app) == Some(app))
+                    .collect();
+                for id in ids {
+                    self.apply_menu(id);
+                }
+                return;
+            }
         }
         self.refresh_gallery();
         self.update_status();
@@ -609,6 +643,56 @@ impl App {
         }
     }
 
+    // --- menu bar ---------------------------------------------------------
+
+    /// Bring proxy `id`'s native menu bar up to its app's newest one: states in
+    /// place when only they changed, else a new bar (once no menu is open).
+    fn apply_menu(&mut self, id: u64) {
+        let Some(app) = self.windows.get(&id).map(|w| w.app) else {
+            return;
+        };
+        let (Some(menus), Some(proxy)) = (self.menus.get(&app), self.proxies.get(&id)) else {
+            return;
+        };
+        if let Some(bar) = self.menu_bars.get_mut(&id) {
+            if bar.update_states(menus) {
+                return;
+            }
+        }
+        if self.in_menu_loop {
+            self.menus_stale.insert(app);
+            return;
+        }
+        let hwnd = proxy.hwnd;
+        match MenuBar::build(menus) {
+            Ok(bar) => unsafe {
+                // Attaching a bar shrinks the client area; the WM_SIZE that
+                // follows asks the host for the new size, as any resize does.
+                let _ = SetMenu(hwnd, bar.hmenu);
+                if let Some(old) = self.menu_bars.insert(id, bar) {
+                    old.destroy();
+                }
+            },
+            Err(e) => eprintln!("menu bar for window {id}: {e}"),
+        }
+    }
+
+    /// Ask the host for `app`'s menu bar again, at most once a second.
+    fn refresh_menus(&mut self, id: u64) {
+        let Some(app) = self.windows.get(&id).map(|w| w.app) else {
+            return;
+        };
+        let due = self
+            .menu_refreshed
+            .get(&app)
+            .map(|t| t.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if due {
+            self.menu_refreshed.insert(app, Instant::now());
+            self.send(&ClientMessage::MenuRefresh { id });
+        }
+    }
+
     // --- proxy lifecycle -------------------------------------------------
 
     fn create_proxy(
@@ -705,6 +789,7 @@ impl App {
         );
         self.hwnd_to_id.insert(hwnd.0 as isize, id);
         self.proxies.insert(id, proxy);
+        self.apply_menu(id);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
         }
@@ -745,6 +830,8 @@ impl App {
 
     fn destroy_proxy(&mut self, id: u64) {
         self.pending_mouse_moves.remove(&id);
+        // An attached bar is destroyed with its window.
+        self.menu_bars.remove(&id);
         if let Some(proxy) = self.proxies.remove(&id) {
             self.hwnd_to_id.remove(&(proxy.hwnd.0 as isize));
             unsafe {
@@ -784,8 +871,8 @@ impl App {
         proxy.set_source(source);
         if (proxy.width != source.w || proxy.height != source.h) && !proxy.in_size_move {
             let hwnd = proxy.hwnd;
-            let outer =
-                super::frame::outer_size(source.w, source.h, super::dpi::dpi_for_window(hwnd));
+            let inset = super::frame::inset(hwnd, super::dpi::dpi_for_window(hwnd));
+            let outer = (source.w as i32 + inset.0, source.h as i32 + inset.1);
             unsafe {
                 if IsZoomed(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -863,11 +950,12 @@ impl App {
             }
             WM_SIZING => {
                 let r = unsafe { &*(lparam.0 as *const RECT) };
-                let size = super::frame::client_size(
-                    (r.right - r.left).max(1) as u32,
-                    (r.bottom - r.top).max(1) as u32,
-                    super::dpi::dpi_for_window(hwnd),
-                );
+                // Measured, not computed: a menu bar is part of the chrome.
+                let inset = super::frame::inset(hwnd, super::dpi::dpi_for_window(hwnd));
+                let size = Size {
+                    w: ((r.right - r.left) - inset.0).max(1) as u32,
+                    h: ((r.bottom - r.top) - inset.1).max(1) as u32,
+                };
                 let mut begin = false;
                 let mut live = false;
                 if let Some(proxy) = self.proxies.get_mut(&id) {
@@ -1000,6 +1088,44 @@ impl App {
                 None
             }
 
+            // A menu pick (not an accelerator or a control's notification).
+            WM_COMMAND if (wparam.0 >> 16) & 0xFFFF == 0 && lparam.0 == 0 => {
+                let pick = self
+                    .menu_bars
+                    .get(&id)
+                    .and_then(|bar| bar.command(wparam.0 & 0xFFFF))
+                    .map(|c| (c.path.clone(), c.title.clone()));
+                if let Some((path, title)) = pick {
+                    self.send(&ClientMessage::MenuPick { id, path, title });
+                }
+                Some(LRESULT(0))
+            }
+            WM_INITMENUPOPUP => {
+                // Opening a menu reads the Mac's again, so what is enabled
+                // follows the app (it lands while this one is open, or next time).
+                self.refresh_menus(id);
+                Some(LRESULT(0))
+            }
+            WM_ENTERMENULOOP => {
+                self.in_menu_loop = true;
+                Some(LRESULT(0))
+            }
+            WM_EXITMENULOOP => {
+                self.in_menu_loop = false;
+                for app in std::mem::take(&mut self.menus_stale) {
+                    let ids: Vec<u64> = self
+                        .proxies
+                        .keys()
+                        .copied()
+                        .filter(|id| self.windows.get(id).map(|w| w.app) == Some(app))
+                        .collect();
+                    for id in ids {
+                        self.apply_menu(id);
+                    }
+                }
+                Some(LRESULT(0))
+            }
+
             WM_CLOSE => {
                 // Close the local view, never the remote document. The card can
                 // reopen the same HWND without changing its position or size.
@@ -1014,6 +1140,7 @@ impl App {
             WM_DESTROY => {
                 self.hwnd_to_id.remove(&(hwnd.0 as isize));
                 self.proxies.remove(&id);
+                self.menu_bars.remove(&id);
                 Some(LRESULT(0))
             }
 
@@ -1091,6 +1218,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(super::frame::hit_test(hit.0 as u32) as isize);
         }
         // Stash the App pointer on NCCREATE, before any other message needs it.
+        // Alt and F10 are the Mac's Option key and an F-key, not a way into the
+        // menu bar: refuse the keyboard's menu activation (the mouse still opens
+        // menus, via SC_MOUSEMENU).
+        if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU {
+            return LRESULT(0);
+        }
         if msg == WM_NCCREATE {
             let cs = &*(lparam.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
@@ -1107,7 +1240,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             | WM_ACTIVATE | WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN
             | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MOUSEWHEEL | WM_MOUSEHWHEEL
             | WM_CAPTURECHANGED | WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
-            | WM_CLOSE | WM_DESTROY => {
+            | WM_CLOSE | WM_DESTROY | WM_COMMAND | WM_INITMENUPOPUP | WM_ENTERMENULOOP
+            | WM_EXITMENULOOP => {
                 let rect = if msg == WM_SIZING || msg == WM_DPICHANGED {
                     Some(*(lparam.0 as *const RECT))
                 } else {

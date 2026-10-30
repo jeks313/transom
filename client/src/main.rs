@@ -32,6 +32,7 @@ mod connections;
 mod discovery;
 #[cfg(any(windows, test))]
 mod hevc;
+mod menu_plan;
 mod model;
 mod net;
 #[cfg(any(windows, test))]

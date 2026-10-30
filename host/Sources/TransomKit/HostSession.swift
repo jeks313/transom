@@ -211,6 +211,10 @@ public final class HostSession: @unchecked Sendable {
     private var eventSink: AsyncStream<(lane: UInt32, event: WindowWatcher.WindowEvent)>.Continuation?
     private var clientSink: AsyncStream<ClientMessage>.Continuation?
     private var tasks: [Task<Void, Never>] = []
+    /// Menu bar reads and presses: each can wait on an app for up to a second.
+    private let menuQueue = DispatchQueue(label: "one.transom.host.menus", qos: .userInitiated)
+    /// Apps with a menu read queued, so a burst of refreshes reads once.
+    private var menuReadsQueued: Set<pid_t> = []
 
     // Everything a background callback writes lives behind this lock.
     private let statsLock = NSLock()
@@ -387,7 +391,7 @@ public final class HostSession: @unchecked Sendable {
         // lane's resize actor), routed to the lane that owns the window, and tick
         // at ~20Hz so a coalesced live from a paused drag still flushes.
         tasks.append(
-            Task {
+            Task { [weak self] in
                 func lane(owning id: UInt64) -> Lane? {
                     lanes.first { $0.registry.element(for: id) != nil }
                 }
@@ -399,6 +403,12 @@ public final class HostSession: @unchecked Sendable {
                         lane(owning: id)?.injector.handle(message)
                     case let .requestClose(id):
                         lane(owning: id)?.injector.close(id: id)
+                    case let .menuPick(id, path, title):
+                        guard let lane = lane(owning: id) else { break }
+                        self?.pressMenu(lane: lane, window: id, path: path.map(Int.init), title: title)
+                    case let .menuRefresh(id):
+                        guard let lane = lane(owning: id) else { break }
+                        self?.readMenus(pid: pid_t(bitPattern: ControlServer.app(of: id, in: lane.registry)))
                     case let .requestKeyframe(laneID):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
@@ -417,6 +427,10 @@ public final class HostSession: @unchecked Sendable {
                 }
             })
         try await controlListener.start()
+
+        for lane in lanes {
+            for target in lane.targets { readMenus(pid: target.pid) }
+        }
 
         if config.video {
             try await startVideo(lanes)
@@ -513,6 +527,53 @@ public final class HostSession: @unchecked Sendable {
         return Lane(
             id: id, targets: targets, display: disp, registry: registry, watchers: watchers,
             resize: resize, injector: injector)
+    }
+
+    /// Read `pid`'s menu bar off the AX threads and hand it to the control server,
+    /// which sends it if it changed.
+    private func readMenus(pid: pid_t) {
+        guard pid > 0, statsLock.withLock({ menuReadsQueued.insert(pid).inserted }) else { return }
+        let namesake = config.namesakeModifiers
+        guard let server = controlServer else { return }
+        menuQueue.async { [weak self] in
+            self?.statsLock.withLock { _ = self?.menuReadsQueued.remove(pid) }
+            guard let menus = MenuReader.read(pid: pid, namesake: namesake) else { return }
+            Task { await server.setMenuBar(app: UInt32(bitPattern: pid), menus: menus) }
+        }
+    }
+
+    /// Choose a menu item for window `id`: make the window key in place first, so
+    /// the item acts on it, then press it and read the bar again (an item can
+    /// toggle a check or change what is enabled).
+    private func pressMenu(lane: Lane, window id: UInt64, path: [Int], title: String) {
+        let pid = pid_t(bitPattern: ControlServer.app(of: id, in: lane.registry))
+        guard pid > 0 else { return }
+        lane.injector.requestFocus(id: id)
+        // The app validates its menus against its key window, which the focus
+        // above sets only once the app has handled the posted events.
+        let namesake = config.namesakeModifiers
+        let injector = lane.injector
+        menuQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            let how: String
+            if let item = MenuReader.item(pid: pid, path: path, title: title) {
+                // The shortcut goes the way a typed one does, so an app that only
+                // enables its window items while frontmost still acts on it.
+                let shortcut = MenuReader.shortcut(of: item, namesake: namesake)
+                if let keys = MenuShortcut.virtualKeys(shortcut) {
+                    for vk in keys { injector.inject(id: id, event: .keyDown(vk: vk), ts: 0) }
+                    for vk in keys.reversed() { injector.inject(id: id, event: .keyUp(vk: vk), ts: 0) }
+                    how = "typed \(shortcut)"
+                } else {
+                    how = String(describing: MenuReader.press(item))
+                }
+            } else {
+                how = "changed"
+            }
+            Log.input.notice(
+                "menu: \(title, privacy: .public) at \(path.map(String.init).joined(separator: "/"), privacy: .public): \(how, privacy: .public)"
+            )
+            self?.menuQueue.asyncAfter(deadline: .now() + 0.3) { self?.readMenus(pid: pid) }
+        }
     }
 
     /// Re-tile a lane whose windows a Mac-side change left overlapping. Runs on

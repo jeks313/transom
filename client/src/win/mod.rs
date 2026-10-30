@@ -20,6 +20,7 @@ mod gallery;
 mod glass;
 mod gpu;
 mod input;
+mod menu;
 mod proxy;
 
 use std::process::ExitCode;
