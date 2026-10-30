@@ -13,6 +13,7 @@ struct PrivateAddressTests {
         for ip in [
             "10.0.0.1", "10.255.255.255", "192.168.0.200", "192.168.1.1",
             "172.16.0.1", "172.31.255.255", "127.0.0.1", "169.254.1.1",
+            "100.64.0.1", "100.102.228.41", "100.127.255.255",
         ] {
             #expect(PrivateAddress.isPrivateIPv4(ip), "\(ip) should be private")
         }
@@ -23,6 +24,7 @@ struct PrivateAddressTests {
         for ip in [
             "8.8.8.8", "1.1.1.1", "172.15.0.1", "172.32.0.1", "192.169.0.1",
             "11.0.0.1", "169.253.0.1", "203.0.113.5",
+            "100.63.255.255", "100.128.0.1",
         ] {
             #expect(!PrivateAddress.isPrivateIPv4(ip), "\(ip) should be public")
         }
