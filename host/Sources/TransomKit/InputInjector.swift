@@ -47,6 +47,10 @@ public final class InputInjector: @unchecked Sendable {
     // Mutable state, all under `lock`.
     private var modifiers = ModifierState()
     private var pointer = PointerRouter()
+    /// Thins the client's moves to what an app can take (`MoveThrottle`).
+    private var moves = MoveThrottle()
+    private var moveFlushScheduled = false
+    private let moveQueue = DispatchQueue(label: "one.transom.host.input.moves")
     // Background-delivery state, all under `lock`.
 
     /// The window a background mouse event is addressed to. `origin` is its
@@ -128,6 +132,7 @@ public final class InputInjector: @unchecked Sendable {
         lock.withLock {
             for post in pointer.releaseAll() { self.post(post, id: 0, ts: 0) }
             modifiers.reset()
+            moves = MoveThrottle()
         }
     }
 
@@ -157,6 +162,18 @@ public final class InputInjector: @unchecked Sendable {
 
     public func inject(id: UInt64, event: InputEvent, ts: UInt64) {
         lock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            if case .mouseMove = event {
+                if let move = moves.onMove(.init(id: id, event: event, ts: ts), now: now) {
+                    routePointer(id: move.id, event: move.event, ts: move.ts)
+                } else {
+                    scheduleMoveFlush(now: now)
+                }
+                return
+            }
+            if let move = moves.takePending(now: now) {
+                routePointer(id: move.id, event: move.event, ts: move.ts)
+            }
             switch event {
             case .mouseDown, .mouseUp, .mouseMove, .scroll:
                 routePointer(id: id, event: event, ts: ts)
@@ -164,6 +181,24 @@ public final class InputInjector: @unchecked Sendable {
                 postKey(id: id, vk: vk, down: true, ts: ts)
             case .keyUp(let vk):
                 postKey(id: id, vk: vk, down: false, ts: ts)
+            }
+        }
+    }
+
+    /// Release the held move once it is due. Assumes `lock` is held.
+    private func scheduleMoveFlush(now: Double) {
+        guard !moveFlushScheduled, let delay = moves.delayUntilDue(now: now) else { return }
+        moveFlushScheduled = true
+        moveQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.lock.withLock {
+                self.moveFlushScheduled = false
+                let now = ProcessInfo.processInfo.systemUptime
+                if let move = self.moves.onTick(now: now) {
+                    self.routePointer(id: move.id, event: move.event, ts: move.ts)
+                } else {
+                    self.scheduleMoveFlush(now: now)
+                }
             }
         }
     }
