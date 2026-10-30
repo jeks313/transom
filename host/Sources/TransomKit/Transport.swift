@@ -69,6 +69,7 @@ public enum PrivateAddress {
         case 192: return b == 168  // 192.168.0.0/16
         case 172: return (16...31).contains(b)  // 172.16.0.0/12
         case 169: return b == 254  // link-local 169.254.0.0/16
+        case 100: return (64...127).contains(b)  // CGNAT 100.64.0.0/10 (Tailscale)
         default: return false
         }
     }
