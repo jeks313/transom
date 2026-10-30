@@ -648,8 +648,10 @@ mod tests {
         let _com = ComApartment::new().unwrap();
         let data = include_bytes!("../../tests/fixtures/hevc-main.wire");
         let mut wire = FramedReceiver::new(&data[..]);
-        let VideoMessage::Config { hvcc } =
-            VideoMessage::decode(&wire.recv().unwrap().unwrap()).unwrap()
+        // The fixture was recorded in v1 framing, with no lane after the tag.
+        let v2 = |p: Vec<u8>| [vec![p[0], 0, 0, 0, 0], p[1..].to_vec()].concat();
+        let VideoMessage::Config { hvcc, .. } =
+            VideoMessage::decode(&v2(wire.recv().unwrap().unwrap())).unwrap()
         else {
             panic!("config expected")
         };
@@ -661,7 +663,7 @@ mod tests {
                 keyframe,
                 pts_micros,
                 ..
-            } = VideoMessage::decode(&payload).unwrap()
+            } = VideoMessage::decode(&v2(payload)).unwrap()
             else {
                 panic!("frame expected")
             };
