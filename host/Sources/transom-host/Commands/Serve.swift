@@ -21,8 +21,16 @@ struct Serve: AsyncParsableCommand {
     @Argument(help: "Target app: a name like \"Xcode\" or a bundle id.")
     var app: String
 
-    @Argument(help: "Display id, as printed by `displays`.")
-    var display: UInt32
+    @Argument(
+        help:
+            "Display id, as printed by `displays`. Omit it to share on a virtual display this session creates (see --display-size)."
+    )
+    var display: UInt32?
+
+    @Option(
+        name: .long,
+        help: "Size of the session's own display in points, WIDTHxHEIGHT, at 2x (used without a display id).")
+    var displaySize: String = "2048x1080"
 
     @Option(
         name: .customLong("also"),
@@ -106,9 +114,32 @@ struct Serve: AsyncParsableCommand {
             case .failure(let e): throw e
             }
         }
-        guard let disp = TransomKit.Displays.byID(display) else {
-            throw ProbeError("no active display with id \(display). See `displays`.")
+        if StageManager.isEnabled {
+            print(
+                "  warning: Stage Manager is on; shared windows draw as thumbnails. Turn it off in Control Center."
+            )
         }
+        // Held for the whole run: releasing it removes the display.
+        var owned: OwnedDisplay?
+        let disp: DisplayInfo
+        if let display {
+            guard let found = TransomKit.Displays.byID(display) else {
+                throw ProbeError("no active display with id \(display). See `displays`.")
+            }
+            disp = found
+        } else {
+            let parts = displaySize.split(separator: "x").compactMap { Int($0) }
+            guard parts.count == 2 else {
+                throw ProbeError("--display-size must be WIDTHxHEIGHT in points, like 2048x1080.")
+            }
+            let made = try await OwnedDisplay.create(
+                name: "Transom \(target.name)", widthPoints: parts[0], heightPoints: parts[1],
+                serial: Self.stableSerial(target.bundleID ?? target.name))
+            owned = made
+            disp = made.info
+        }
+        defer { withExtendedLifetime(owned) {} }
+        let display = disp.id
         guard let videoFormat = HEVCEncoder.Format(cliToken: chroma) else {
             throw ProbeError("unknown --chroma \"\(chroma)\"; expected 420 or 444.")
         }
@@ -172,6 +203,14 @@ struct Serve: AsyncParsableCommand {
                 printStatusLine(session.status())
             }
         }
+    }
+
+    /// FNV-1a of the app's bundle id: the same app gets the same display serial
+    /// every session, so macOS keeps one remembered arrangement for it.
+    static func stableSerial(_ key: String) -> UInt32 {
+        var hash: UInt32 = 2_166_136_261
+        for byte in key.utf8 { hash = (hash ^ UInt32(byte)) &* 16_777_619 }
+        return hash
     }
 
     private func printStatusLine(_ s: HostStatus) {

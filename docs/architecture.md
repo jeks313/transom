@@ -257,11 +257,21 @@ at full rate, background windows at 5-10fps or frozen until they change.
 **This is not in scope.** It solves a problem we do not have. Documented only so
 it is not reinvented from scratch later.
 
-### 3.5 The virtual display is created externally
+### 3.5 The virtual display: given, or made by the session
 
-`CGVirtualDisplay` is private API. Transom does **not** create the virtual
-display. Use BetterDisplay (or equivalent) and pass the resulting display ID to
-the host. The host targets whatever display ID it is given.
+`serve <app> <display>` targets whatever display ID it is given (BetterDisplay or
+equivalent). `serve <app>` with no display creates its own with the private
+`CGVirtualDisplay` API (vendored from Sill, Apache-2.0, in
+`Sources/transom-display`): a child process that holds the display at 2x
+(`--display-size`, default 2048x1080 pt), places it to the right of every other
+display, keeps the Mac out of idle display sleep (a locked Mac refuses AX window
+moves), and exits when `serve` stops or dies, taking the display with it.
+
+**It is not main, and need not be.** Every host conversion goes through the
+display's origin (`DisplayInfo.originPoints`), so 3.2's "virtual display is main"
+is not load-bearing; measured on macOS 26.7 with Safari and Chrome. Leaving the
+real screen main keeps the menu bar, Dock and permission prompts (the firewall's
+"allow incoming connections" among them) where the person at the Mac sees them.
 
 ---
 

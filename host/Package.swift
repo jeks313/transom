@@ -31,6 +31,15 @@ let package = Package(
                 .swiftLanguageMode(.v6)
             ]
         ),
+        // Owns a session's virtual display (`serve` without a display id runs it
+        // as a child). Separate because the creating process needs an AppKit event
+        // loop. Swift 5 mode: VirtualDisplay.swift is vendored from Sill unchanged.
+        .executableTarget(
+            name: "transom-display",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
         // The SwiftUI probe app. Built as a bare executable here; wrapped into
         // `Transom Probe.app` (stable bundle id, own TCC identity) by
         // scripts/make-app.sh. See issue Part 2/3.
