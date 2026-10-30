@@ -39,6 +39,8 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
 
     private let lock = NSLock()
     private var stream: SCStream?
+    /// Which `start` attempt is current; an abandoned one that starts late stops itself.
+    private var startAttempt = 0
     private var latestPixelBuffer: CVPixelBuffer?
     private var _stats: FrameStats?
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
@@ -75,7 +77,57 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
 
     /// Start the stream. Throws if SCK cannot see the display or Screen Recording
     /// permission is absent.
+    ///
+    /// SCK sometimes never answers a start while another process is capturing
+    /// (replayd logs "connection interrupted" and the call's continuation leaks;
+    /// seen every few starts on macOS 26). Each attempt is bounded, and a stuck
+    /// one is abandoned for a fresh stream.
     public func start() async throws {
+        var lastError: Error = CaptureError.startTimedOut
+        for attempt in 1...Self.startAttempts {
+            do {
+                lock.withLock { startAttempt = attempt }
+                try await Self.bounded(seconds: Self.startTimeout) {
+                    try await self.startOnce(attempt: attempt)
+                }
+                return
+            } catch CaptureError.startTimedOut {
+                Log.encode.notice(
+                    "capture: start attempt \(attempt, privacy: .public) on display \(self.display.id, privacy: .public) got no answer; retrying"
+                )
+                lastError = CaptureError.startTimedOut
+            }
+        }
+        throw lastError
+    }
+
+    static let startAttempts = 4
+    static let startTimeout = 5.0
+
+    /// Run `operation`, or throw `startTimedOut` after `seconds` without waiting
+    /// for it: an operation whose callback never comes is left behind, not awaited.
+    static func bounded(seconds: Double, _ operation: @escaping @Sendable () async throws -> Void)
+        async throws
+    {
+        let once = ResumeOnce()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            once.set(cont)
+            Task {
+                do {
+                    try await operation()
+                    once.resume(with: .success(()))
+                } catch {
+                    once.resume(with: .failure(error))
+                }
+            }
+            Task {
+                try? await Task.sleep(for: .seconds(seconds))
+                once.resume(with: .failure(CaptureError.startTimedOut))
+            }
+        }
+    }
+
+    private func startOnce(attempt: Int) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: false)
         guard let scDisplay = content.displays.first(where: { $0.displayID == display.id })
@@ -117,7 +169,14 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
         }
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try await stream.startCapture()
-        lock.withLock { self.stream = stream }
+        // An attempt that was given up on may still start late; only the
+        // current one keeps its stream.
+        let current = lock.withLock {
+            guard startAttempt == attempt else { return false }
+            self.stream = stream
+            return true
+        }
+        if !current { try? await stream.stopCapture() }
     }
 
     public func stop() async {
@@ -252,9 +311,12 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
 public enum CaptureError: Error, CustomStringConvertible {
     case displayNotFound(CGDirectDisplayID)
     case noSelectedApplications
+    case startTimedOut
 
     public var description: String {
         switch self {
+        case .startTimedOut:
+            return "ScreenCaptureKit did not start capturing. Stop other sharing sessions and try again."
         case .displayNotFound(let id):
             return "ScreenCaptureKit does not see display id \(id)."
         case .noSelectedApplications:
@@ -275,4 +337,22 @@ public func fourCC(_ code: OSType) -> String {
     let scalars = bytes.map { Character(UnicodeScalar($0)) }
     let s = String(scalars).trimmingCharacters(in: .whitespaces)
     return s.isEmpty ? String(code) : "\(s) (0x\(String(code, radix: 16)))"
+}
+
+/// Resumes a continuation exactly once, whichever side gets there first.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    func set(_ continuation: CheckedContinuation<Void, Error>) {
+        lock.withLock { self.continuation = continuation }
+    }
+
+    func resume(with result: Result<Void, Error>) {
+        let c: CheckedContinuation<Void, Error>? = lock.withLock {
+            defer { continuation = nil }
+            return continuation
+        }
+        c?.resume(with: result)
+    }
 }

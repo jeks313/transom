@@ -42,3 +42,20 @@ struct WindowCaptureTests {
         }
     }
 }
+
+@Suite("Capture start bound")
+struct CaptureStartBoundTests {
+    @Test("an operation that never answers times out instead of hanging")
+    func timesOut() async {
+        await #expect(throws: CaptureError.self) {
+            try await DisplayCapture.bounded(seconds: 0.05) {
+                try await Task.sleep(for: .seconds(3600))
+            }
+        }
+    }
+
+    @Test("a prompt operation's result comes through")
+    func passesThrough() async throws {
+        try await DisplayCapture.bounded(seconds: 5) {}
+    }
+}
