@@ -49,25 +49,41 @@ public final class OwnedDisplay: @unchecked Sendable {
 
         let reader = stdout.fileHandleForReading
         let line = await Task.detached { Self.firstLine(of: reader) }.value
-        guard let line, line.hasPrefix("ready "),
-            let idField = line.split(separator: " ").first(where: { $0.hasPrefix("id=") }),
-            let id = CGDirectDisplayID(idField.dropFirst(3))
+        // The geometry comes from the child, which waited for the mode and placed
+        // the display. This process's own CoreGraphics display list is refreshed
+        // by a WindowServer notification an async command never receives, so a
+        // second display made by the same process never appears in it.
+        guard let line, let info = Self.parseReady(line),
+            info.pixelWidth == widthPoints * 2
         else {
             child.terminate()
             throw ProbeError("transom-display failed: \(line ?? "exited without output")")
         }
+        return OwnedDisplay(info: info, child: child, stdin: stdin)
+    }
 
-        // The child already waited for the mode; this process learns of it a
-        // moment later.
-        let wantWidth = widthPoints * 2
-        for _ in 0..<60 {
-            if let info = Displays.byID(id), info.pixelWidth == wantWidth {
-                return OwnedDisplay(info: info, child: child, stdin: stdin)
-            }
-            try? await Task.sleep(for: .milliseconds(50))
+    /// `ready id=<id> origin=<x>,<y> pt=<w>x<h> px=<w>x<h>` as a display.
+    static func parseReady(_ line: String) -> DisplayInfo? {
+        guard line.hasPrefix("ready ") else { return nil }
+        var fields: [Substring: Substring] = [:]
+        for part in line.split(separator: " ").dropFirst() {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            if kv.count == 2 { fields[kv[0]] = kv[1] }
         }
-        child.terminate()
-        throw ProbeError("display \(id) did not appear at \(widthPoints)x\(heightPoints) pt @2x.")
+        func pair(_ key: Substring, _ separator: Character) -> (Int, Int)? {
+            guard let parts = fields[key]?.split(separator: separator), parts.count == 2,
+                let a = Int(parts[0]), let b = Int(parts[1])
+            else { return nil }
+            return (a, b)
+        }
+        guard let id = fields["id"].flatMap({ CGDirectDisplayID($0) }),
+            let origin = pair("origin", ","), let pt = pair("pt", "x"), let px = pair("px", "x"),
+            pt.0 > 0
+        else { return nil }
+        return DisplayInfo(
+            id: id, originPoints: CGPoint(x: origin.0, y: origin.1),
+            sizePoints: CGSize(width: pt.0, height: pt.1), pixelWidth: px.0, pixelHeight: px.1,
+            scale: Double(px.0) / Double(pt.0), isMain: false)
     }
 
     /// Release the display. Safe to call more than once.
