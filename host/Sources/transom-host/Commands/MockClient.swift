@@ -156,17 +156,21 @@ struct MockClient: AsyncParsableCommand {
     /// window's id → rect. Stops at `tileLayout` (the last resync message).
     private func readResync(_ transport: TCPTransport) async throws -> [UInt64: WireRect] {
         var windows: [UInt64: WireRect] = [:]
+        var remainingLayouts = 1
         while let frame = try await transport.receiveFrame() {
             let message = try WireCodec.decodeControl(frame)
             switch message {
-            case .hello(let version, let vdsSize):
-                print("mock-client: hello protocol=\(version) vds=\(vdsSize.w)x\(vdsSize.h)")
-            case .windowCreated(let id, let rect, let title, _):
+            case .hello(let version, let lanes):
+                let sizes = lanes.map { "\($0.lane):\($0.vdsSize.w)x\($0.vdsSize.h)" }
+                print("mock-client: hello protocol=\(version) lanes=\(sizes.joined(separator: " "))")
+                remainingLayouts = lanes.count
+            case .windowCreated(let id, let lane, let rect, let title, _):
                 windows[id] = rect
-                print("mock-client:   windowCreated id=\(id) \"\(title)\"")
-            case .tileLayout(let ws, _):
+                print("mock-client:   windowCreated id=\(id) lane=\(lane) \"\(title)\"")
+            case .tileLayout(_, let ws, _):
                 for w in ws where windows[w.id] == nil { windows[w.id] = w.rect }
-                return windows
+                remainingLayouts -= 1
+                if remainingLayouts <= 0 { return windows }
             default:
                 continue
             }

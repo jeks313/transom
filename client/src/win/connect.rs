@@ -10,7 +10,7 @@ use crate::{
     wire::Size,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ffi::c_void,
     path::PathBuf,
     sync::mpsc,
@@ -97,7 +97,8 @@ struct State {
     view: usize,
     list: bool,
     sort_name: bool,
-    last_preview: Instant,
+    /// Per lane, when its previews were last refreshed.
+    last_preview: HashMap<u32, Instant>,
 }
 pub struct Dashboard {
     pub hwnd: HWND,
@@ -153,7 +154,7 @@ impl Dashboard {
             view: NAV_APPS,
             list: false,
             sort_name: true,
-            last_preview: Instant::now() - Duration::from_secs(1),
+            last_preview: HashMap::new(),
         });
         let hwnd = unsafe {
             CreateWindowExW(
@@ -294,12 +295,18 @@ impl Dashboard {
             self.state.layout();
         }
     }
-    pub fn update_previews_nv12(&mut self, nv12: &[u8], stride: usize, display: Size) {
-        if self.state.last_preview.elapsed() < Duration::from_millis(250) {
+    /// Refresh the cards of `lane`'s windows from its newest decoded frame.
+    pub fn update_previews_nv12(&mut self, lane: u32, nv12: &[u8], stride: usize, display: Size) {
+        let last = self
+            .state
+            .last_preview
+            .entry(lane)
+            .or_insert_with(|| Instant::now() - Duration::from_secs(1));
+        if last.elapsed() < Duration::from_millis(250) {
             return;
         }
-        self.state.last_preview = Instant::now();
-        for c in &mut self.state.cards {
+        *last = Instant::now();
+        for c in self.state.cards.iter_mut().filter(|c| c.window.lane == lane) {
             c.update_preview_nv12(nv12, stride, display);
         }
         unsafe {

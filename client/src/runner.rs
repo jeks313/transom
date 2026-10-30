@@ -72,7 +72,6 @@ pub fn run(args: &[String]) -> ExitCode {
     // --type/--click/--resize and print titles.
     let mut windows: HashMap<u64, (String, Rect)> = HashMap::new();
     let mut order: Vec<u64> = Vec::new();
-    let mut vds: Option<Size> = None;
 
     // Actions that fire once, after the first window is known.
     let mut pending_actions =
@@ -113,12 +112,12 @@ pub fn run(args: &[String]) -> ExitCode {
 
         match event {
             SessionEvent::Control(ev) => {
-                apply_for_display(&ev, &mut windows, &mut order, &mut vds);
+                apply_for_display(&ev, &mut windows, &mut order);
                 print_control(&ev, now_ms());
             }
-            SessionEvent::Video(VideoEvent::Config { hvcc }) => {
+            SessionEvent::Video(VideoEvent::Config { lane, hvcc }) => {
                 println!(
-                    "[{:>6}ms] video: hvcC config, {} bytes (decoder can now start)",
+                    "[{:>6}ms] video: lane {lane} hvcC config, {} bytes (decoder can now start)",
                     now_ms(),
                     hvcc.len()
                 );
@@ -182,10 +181,8 @@ fn apply_for_display(
     ev: &ModelEvent,
     windows: &mut HashMap<u64, (String, Rect)>,
     order: &mut Vec<u64>,
-    vds: &mut Option<Size>,
 ) {
     match ev {
-        ModelEvent::Connected { vds: size } => *vds = Some(*size),
         ModelEvent::WindowAdded(w) => {
             if !order.contains(&w.id) {
                 order.push(w.id);
@@ -218,12 +215,16 @@ fn apply_for_display(
 
 fn print_control(ev: &ModelEvent, t: u64) {
     match ev {
-        ModelEvent::Connected { vds } => {
-            println!("[{t:>6}ms] connected — VDS {}x{}", vds.w, vds.h)
+        ModelEvent::Connected { lanes } => {
+            let sizes: Vec<String> = lanes
+                .iter()
+                .map(|l| format!("lane {} {}x{}", l.lane, l.vds.w, l.vds.h))
+                .collect();
+            println!("[{t:>6}ms] connected — {}", sizes.join(", "))
         }
         ModelEvent::WindowAdded(w) => println!(
-            "[{t:>6}ms] + window {} \"{}\" {:?} source ({},{}) {}x{}",
-            w.id, w.title, w.kind, w.source.x, w.source.y, w.source.w, w.source.h
+            "[{t:>6}ms] + window {} lane {} \"{}\" {:?} source ({},{}) {}x{}",
+            w.id, w.lane, w.title, w.kind, w.source.x, w.source.y, w.source.w, w.source.h
         ),
         ModelEvent::WindowRectChanged {
             id,

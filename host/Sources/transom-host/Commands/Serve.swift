@@ -38,6 +38,14 @@ struct Serve: AsyncParsableCommand {
     var additionalApps: [String] = []
 
     @Option(
+        name: .customLong("lane"),
+        help: ArgumentHelp(
+            "Share more apps on a display of their own, over the same connection (repeatable).",
+            discussion: "APP[,APP...][=WIDTHxHEIGHT]: the apps, then the display size in points (default --display-size).",
+            valueName: "apps"))
+    var lanes: [String] = []
+
+    @Option(
         name: .long,
         help: "Private address to bind (default localhost). Use the LAN IP for a real client.")
     var host: String = "127.0.0.1"
@@ -108,19 +116,40 @@ struct Serve: AsyncParsableCommand {
         case .success(let t): target = t
         case .failure(let e): throw e
         }
-        let additional = try additionalApps.map { token -> TargetApp in
+        func resolve(_ token: String) throws -> TargetApp {
             switch AppResolver.resolve(token) {
             case .success(let t): return t
             case .failure(let e): throw e
             }
+        }
+        let additional = try additionalApps.map(resolve)
+        // Each --lane: its apps and its display size in points.
+        let laneSpecs = try lanes.map { spec -> (apps: [TargetApp], size: String) in
+            let parts = spec.split(separator: "=", maxSplits: 1).map(String.init)
+            let apps = try parts[0].split(separator: ",").map {
+                try resolve($0.trimmingCharacters(in: .whitespaces))
+            }
+            guard !apps.isEmpty else { throw ProbeError("--lane \"\(spec)\" names no app.") }
+            return (apps, parts.count > 1 ? parts[1] : displaySize)
         }
         if StageManager.isEnabled {
             print(
                 "  warning: Stage Manager is on; shared windows draw as thumbnails. Turn it off in Control Center."
             )
         }
-        // Held for the whole run: releasing it removes the display.
-        var owned: OwnedDisplay?
+        // Held for the whole run: releasing one removes its display.
+        var owned: [OwnedDisplay] = []
+        func ownDisplay(for app: TargetApp, size: String) async throws -> DisplayInfo {
+            let parts = size.split(separator: "x").compactMap { Int($0) }
+            guard parts.count == 2 else {
+                throw ProbeError("display size \"\(size)\" must be WIDTHxHEIGHT in points, like 2048x1080.")
+            }
+            let made = try await OwnedDisplay.create(
+                name: "Transom \(app.name)", widthPoints: parts[0], heightPoints: parts[1],
+                serial: Self.stableSerial(app.bundleID ?? app.name))
+            owned.append(made)
+            return made.info
+        }
         let disp: DisplayInfo
         if let display {
             guard let found = TransomKit.Displays.byID(display) else {
@@ -128,18 +157,14 @@ struct Serve: AsyncParsableCommand {
             }
             disp = found
         } else {
-            let parts = displaySize.split(separator: "x").compactMap { Int($0) }
-            guard parts.count == 2 else {
-                throw ProbeError("--display-size must be WIDTHxHEIGHT in points, like 2048x1080.")
-            }
-            let made = try await OwnedDisplay.create(
-                name: "Transom \(target.name)", widthPoints: parts[0], heightPoints: parts[1],
-                serial: Self.stableSerial(target.bundleID ?? target.name))
-            owned = made
-            disp = made.info
+            disp = try await ownDisplay(for: target, size: displaySize)
+        }
+        var moreLanes: [LaneConfig] = []
+        for spec in laneSpecs {
+            moreLanes.append(
+                LaneConfig(targets: spec.apps, display: try await ownDisplay(for: spec.apps[0], size: spec.size)))
         }
         defer { withExtendedLifetime(owned) {} }
-        let display = disp.id
         guard let videoFormat = HEVCEncoder.Format(cliToken: chroma) else {
             throw ProbeError("unknown --chroma \"\(chroma)\"; expected 420 or 444.")
         }
@@ -150,7 +175,8 @@ struct Serve: AsyncParsableCommand {
         }
 
         let config = HostConfig(
-            target: target, additionalTargets: additional, display: disp, host: host,
+            target: target, additionalTargets: additional, display: disp, moreLanes: moreLanes,
+            host: host,
             controlPort: controlPort,
             videoPort: videoPort, gutter: gutter, tile: tile, video: video,
             bitrateMbps: bitrate, fps: fps, videoFormat: videoFormat,
@@ -159,9 +185,11 @@ struct Serve: AsyncParsableCommand {
         )
         let session = HostSession(config: config)
 
-        print(
-            "serve: \(([target] + additional).map(\.name).joined(separator: ", ")) on display \(display) (\(disp.pixelWidth)x\(disp.pixelHeight) px)"
-        )
+        for (index, lane) in config.lanes.enumerated() {
+            print(
+                "serve: lane \(index): \(lane.targets.map(\.name).joined(separator: ", ")) on display \(lane.display.id) (\(lane.display.pixelWidth)x\(lane.display.pixelHeight) px)"
+            )
+        }
         print(
             "  control: \(host):\(controlPort)   video: \(video ? "\(host):\(videoPort)" : "off")")
 

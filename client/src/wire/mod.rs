@@ -19,7 +19,8 @@ pub mod video;
 // build they read as unused even though they are not.
 #[allow(unused_imports)]
 pub use control::{
-    ClientMessage, DecodeError, Rect, ResizePhase, ServerMessage, Size, TileWindow, WindowKind,
+    ClientMessage, DecodeError, Lane, Rect, ResizePhase, ServerMessage, Size, TileWindow,
+    WindowKind,
 };
 #[allow(unused_imports)]
 pub use frame::{frame, FrameError, FrameReader};
@@ -29,7 +30,7 @@ pub use input::{InputEvent, MouseButton};
 pub use video::{VideoDecodeError, VideoMessage};
 
 /// The protocol version this client speaks, checked against the host's `hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Product-default TCP ports (protocol.md §1). These are defaults, not wire
 /// constants; the host can be told to use others. The pair avoids macOS

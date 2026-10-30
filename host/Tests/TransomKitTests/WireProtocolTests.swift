@@ -21,14 +21,20 @@ struct WireProtocolTests {
     @Test("every host->client message round-trips")
     func controlRoundTrips() throws {
         let messages: [ControlMessage] = [
-            .hello(protocolVersion: 1, vdsSize: WireSize(w: 3840, h: 2160)),
+            .hello(
+                protocolVersion: 2,
+                lanes: [
+                    WireLane(lane: 0, vdsSize: WireSize(w: 3840, h: 2160)),
+                    WireLane(lane: 1, vdsSize: WireSize(w: 4096, h: 2160)),
+                ]),
             .windowCreated(
-                id: 1, rect: WireRect(x: 0, y: 60, w: 1312, h: 844), title: "Xcode", kind: .normal),
+                id: 1, lane: 1, rect: WireRect(x: 0, y: 60, w: 1312, h: 844), title: "Xcode", kind: .normal),
             .windowMoved(id: 1, rect: WireRect(x: 1512, y: 60, w: 1312, h: 844)),
             .windowDestroyed(id: 7),
             .windowTitle(id: 1, title: "main.swift — edited"),
             .windowFocused(id: 1),
             .tileLayout(
+                lane: 1,
                 windows: [
                     WireWindow(id: 1, rect: WireRect(x: 0, y: 60, w: 100, h: 100)),
                     WireWindow(id: 2, rect: WireRect(x: 300, y: 60, w: 100, h: 100)),
@@ -47,7 +53,8 @@ struct WireProtocolTests {
             .requestResize(id: 1, size: WireSize(w: 2560, h: 1440), phase: .end),
             .requestFocus(id: 3),
             .requestClose(id: 3),
-            .requestKeyframe,
+            .requestKeyframe(lane: nil),
+            .requestKeyframe(lane: 2),
             .input(id: 7, event: .mouseDown(x: 12, y: 34, button: .left), ts: 1000),
             .input(id: 7, event: .mouseUp(x: 12, y: 34, button: .right), ts: 1001),
             .input(id: 7, event: .mouseMove(x: 640, y: 480), ts: 1002),
@@ -105,6 +112,32 @@ struct WireProtocolTests {
         let rect = try #require(obj["rect"] as? [String: Any])
         #expect(rect["x"] as? Int == 10)
         #expect(rect["w"] as? Int == 30)
+    }
+
+    @Test("hello and windowCreated carry lanes in the documented shape")
+    func laneShapes() throws {
+        let hello = try #require(
+            try JSONSerialization.jsonObject(
+                with: WireCodec.encode(
+                    .hello(protocolVersion: 2, lanes: [WireLane(lane: 3, vdsSize: WireSize(w: 8, h: 6))])))
+                as? [String: Any])
+        #expect(hello["protocol"] as? Int == 2)
+        let lanes = try #require(hello["lanes"] as? [[String: Any]])
+        #expect(lanes.first?["lane"] as? Int == 3)
+        #expect((lanes.first?["vdsSize"] as? [String: Any])?["w"] as? Int == 8)
+        let created = try #require(
+            try JSONSerialization.jsonObject(
+                with: WireCodec.encode(
+                    .windowCreated(
+                        id: 4, lane: 3, rect: WireRect(x: 0, y: 0, w: 1, h: 1), title: "t",
+                        kind: .normal))) as? [String: Any])
+        #expect(created["lane"] as? Int == 3)
+    }
+
+    @Test("a requestKeyframe with no lane means every lane")
+    func keyframeWithoutLane() throws {
+        let message = try WireCodec.decodeClient(Data(#"{"type":"requestKeyframe"}"#.utf8))
+        #expect(message == .requestKeyframe(lane: nil))
     }
 
     @Test("an unknown type is a decode error, not a crash")
@@ -173,16 +206,21 @@ struct WireProtocolTests {
     @Test("video config round-trips")
     func videoConfigRoundTrips() {
         let hvcc = Data([1, 2, 3, 4, 5])
-        #expect(VideoWire.decode(VideoWire.encodeConfig(hvcc: hvcc)) == .config(hvcc: hvcc))
+        #expect(
+            VideoWire.decode(VideoWire.encodeConfig(lane: 7, hvcc: hvcc))
+                == .config(lane: 7, hvcc: hvcc))
     }
 
     @Test("video frame round-trips with its header")
     func videoFrameRoundTrips() {
         let payload = Data([0xAB, 0xCD, 0xEF])
         let encoded = VideoWire.encodeFrame(
-            seq: 12_345, ptsMicros: 9_876_543, keyframe: true, data: payload)
+            lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true, data: payload)
+        #expect(Array(encoded.prefix(5)) == [0x02, 0x01, 0x02, 0x03, 0x04])
         #expect(
             VideoWire.decode(encoded)
-                == .frame(seq: 12_345, ptsMicros: 9_876_543, keyframe: true, data: payload))
+                == .frame(
+                    lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true,
+                    data: payload))
     }
 }

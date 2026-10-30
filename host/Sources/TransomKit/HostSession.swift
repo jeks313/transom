@@ -3,12 +3,27 @@ import CoreGraphics
 import CoreMedia
 import Foundation
 
-/// Everything needed to start serving one app on one display: the same knobs the
+/// One lane of a session: the apps shared on one display, captured and encoded
+/// on its own (protocol.md §1). The first target is the lane's primary app.
+public struct LaneConfig: Sendable {
+    public var targets: [TargetApp]
+    public var display: DisplayInfo
+
+    public init(targets: [TargetApp], display: DisplayInfo) {
+        self.targets = targets
+        self.display = display
+    }
+}
+
+/// Everything needed to start serving apps on their displays: the same knobs the
 /// `serve` CLI takes, in one `Sendable` value the host app can also build.
 public struct HostConfig: Sendable {
-    public var target: TargetApp
-    public var additionalTargets: [TargetApp]
-    public var display: DisplayInfo
+    /// Every lane, lane 0 first. Lane ids on the wire are indices into this.
+    public var lanes: [LaneConfig]
+    /// Lane 0's primary app, its other apps and its display.
+    public var target: TargetApp { lanes[0].targets[0] }
+    public var additionalTargets: [TargetApp] { Array(lanes[0].targets.dropFirst()) }
+    public var display: DisplayInfo { lanes[0].display }
     public var host: String
     public var controlPort: UInt16
     public var videoPort: UInt16
@@ -35,10 +50,15 @@ public struct HostConfig: Sendable {
     /// (`WindowRestorer`). Off shares only what is already on the display.
     public var restoreWindows: Bool
 
+    /// - Parameters:
+    ///   - target, additionalTargets, display: lane 0.
+    ///   - moreLanes: further lanes, each on its own display. An app already in an
+    ///     earlier lane is dropped from a later one, and a lane left empty with it.
     public init(
         target: TargetApp,
         additionalTargets: [TargetApp] = [],
         display: DisplayInfo,
+        moreLanes: [LaneConfig] = [],
         host: String = "127.0.0.1",
         controlPort: UInt16 = TransomPorts.control,
         videoPort: UInt16 = TransomPorts.video,
@@ -53,10 +73,10 @@ public struct HostConfig: Sendable {
         inputDelivery: InputDelivery = .background,
         restoreWindows: Bool = true
     ) {
-        self.target = target
-        var seen: Set<pid_t> = [target.pid]
-        self.additionalTargets = additionalTargets.filter { seen.insert($0.pid).inserted }
-        self.display = display
+        var seen: Set<pid_t> = []
+        self.lanes = ([LaneConfig(targets: [target] + additionalTargets, display: display)] + moreLanes)
+            .map { LaneConfig(targets: $0.targets.filter { seen.insert($0.pid).inserted }, display: $0.display) }
+            .filter { !$0.targets.isEmpty }
         self.host = host
         self.controlPort = controlPort
         self.videoPort = videoPort
@@ -88,14 +108,16 @@ public struct HostStatus: Sendable {
     public var controlClientConnected = false
     public var videoClientConnected = false
 
-    /// Frames/sec and Mbps measured over the last ~1.5 s of encoded output.
+    /// Frames/sec and Mbps measured over the last ~1.5 s of encoded output, summed
+    /// over every lane.
     public var measuredFPS = 0.0
     public var measuredBitrateMbps = 0.0
     /// Mean host-side pipeline latency (capture handoff → encoded frame), in ms.
     public var encodeLatencyMillis = 0.0
     public var totalFramesEncoded = 0
 
-    /// VideoToolbox's own read-back of whether the encoder is on the hardware path.
+    /// VideoToolbox's own read-back of whether the encoder is on the hardware path
+    /// (every lane's).
     public var usingHardware = false
     /// The chroma / bit-depth the encoder was configured to produce. Known before
     /// the first frame, so the UI/CLI can show the mode immediately.
@@ -104,11 +126,12 @@ public struct HostStatus: Sendable {
     /// 8-bit"), captured on the first encoded frame.
     public var encoderFormatSummary = "—"
 
-    /// The startup tile layout with post-clamp actual rects and deltas (I-4/OQ-2).
+    /// The startup tile layout with post-clamp actual rects and deltas (I-4/OQ-2),
+    /// lane by lane.
     public var tilePlacements: [TilePlacement] = []
     /// Set if the tiler could not lay the window set out (surfaced, not swallowed).
     public var tileError: String?
-    /// Live count of windows the AX watcher currently tracks.
+    /// Live count of windows the AX watchers currently track, in every lane.
     public var liveWindowCount = 0
     /// Things the session did to the Mac's windows that the person at the Mac
     /// should know about: windows it restored, windows it left out.
@@ -155,16 +178,18 @@ public struct HostPreview {
     }
 }
 
-/// The serving pipeline for one app on one display, extracted from the `serve`
-/// command so the CLI and the SwiftUI host app drive the **same** code (the app
-/// is a thin shell over `serve`, not a fork of it).
+/// The serving pipeline for a session's lanes, extracted from the `serve` command
+/// so the CLI and the SwiftUI host app drive the **same** code (the app is a thin
+/// shell over `serve`, not a fork of it).
 ///
-/// It tiles the app's windows once at startup (I-5), watches them via AX and
-/// streams lifecycle + geometry on the control channel, and — with `video` —
-/// captures the display and HEVC-encodes it in hardware (chroma per
-/// `config.videoFormat`, default 4:2:0 8-bit so the client's in-box decoder shows
-/// pixels) on a second channel. Capture and AX never stop while a client comes and
-/// goes; a reconnect resyncs from the registry (see `ControlServer`).
+/// Each lane is one display with its apps: it tiles their windows once at startup
+/// (I-5), watches them via AX, and — with `video` — captures its display and
+/// HEVC-encodes it in hardware (chroma per `config.videoFormat`, default 4:2:0
+/// 8-bit so the client's in-box decoder shows pixels). Every lane shares one
+/// control and one video connection (protocol v2): window ids are unique across
+/// lanes, and each video message names its lane. Capture and AX never stop while
+/// a client comes and goes; a reconnect resyncs from the registries (see
+/// `ControlServer`).
 ///
 /// ### Concurrency
 /// `@unchecked Sendable` on the same confinement invariant the rest of this
@@ -177,18 +202,14 @@ public final class HostSession: @unchecked Sendable {
     public let config: HostConfig
 
     // Lifecycle-owned; mutated only inside start()/stop().
-    private var registry: WindowRegistry?
-    private var watchers: [WindowWatcher] = []
+    private var lanes: [Lane] = []
     private var watcherRunLoop: CFRunLoop?
     private var controlListener: TCPListener?
     private var videoListener: TCPListener?
     private var controlServer: ControlServer?
     private var videoServer: VideoServer?
-    private var capture: DisplayCapture?
-    private var encoder: HEVCEncoder?
-    private var eventSink: AsyncStream<WindowWatcher.WindowEvent>.Continuation?
+    private var eventSink: AsyncStream<(lane: UInt32, event: WindowWatcher.WindowEvent)>.Continuation?
     private var clientSink: AsyncStream<ClientMessage>.Continuation?
-    private var injector: InputInjector?
     private var tasks: [Task<Void, Never>] = []
 
     // Everything a background callback writes lives behind this lock.
@@ -199,17 +220,18 @@ public final class HostSession: @unchecked Sendable {
     private var totalFrames = 0
     private var encoderFormatSummary = "—"
     private var usingHardware = false
-    private var tilePlacements: [TilePlacement] = []
+    private var tilePlacements: [UInt32: [TilePlacement]] = [:]
     private var tileError: String?
     private var notices: [String] = []
     private var videoEnabled = false
     /// (uptimeNanos, compressedBytes) of recently encoded frames, trimmed to a
     /// short window so fps/bitrate reflect *now*, not the whole session.
     private var frameSamples: [(t: UInt64, bytes: Int)] = []
-    /// FIFO of capture-handoff timestamps awaiting their encoded output, so each
-    /// output frame can be matched to its input for a latency measurement. Encoded
-    /// output is in input order (frame reordering is off), so front-matching holds.
-    private var pendingEncodeStarts: [UInt64] = []
+    /// Per lane, a FIFO of capture-handoff timestamps awaiting their encoded
+    /// output, so each output frame can be matched to its input for a latency
+    /// measurement. Encoded output is in input order (frame reordering is off), so
+    /// front-matching holds within a lane.
+    private var pendingEncodeStarts: [UInt32: [UInt64]] = [:]
     private var latencySamplesMs: [Double] = []
 
     /// Sliding window for the fps/bitrate estimate.
@@ -222,7 +244,7 @@ public final class HostSession: @unchecked Sendable {
     /// A snapshot of the current state. Cheap; safe from any thread.
     public func status() -> HostStatus {
         var s = HostStatus()
-        let liveCount = registry?.snapshot().count ?? 0
+        let liveCount = lanes.reduce(0) { $0 + $1.registry.snapshot().count }
         statsLock.withLock {
             trimRateWindowLocked()
             s.running = isRunning
@@ -233,7 +255,7 @@ public final class HostSession: @unchecked Sendable {
             s.usingHardware = usingHardware
             s.videoFormat = config.videoFormat
             s.encoderFormatSummary = encoderFormatSummary
-            s.tilePlacements = tilePlacements
+            s.tilePlacements = tilePlacements.keys.sorted().flatMap { tilePlacements[$0] ?? [] }
             s.tileError = tileError
             s.notices = notices
             let (fps, mbps) = rateLocked()
@@ -247,7 +269,7 @@ public final class HostSession: @unchecked Sendable {
         return s
     }
 
-    /// The latest capture frame + the live window rects, for the host app's
+    /// Lane 0's latest capture frame + its live window rects, for the host app's
     /// stream-preview panel. Cheap enough to poll ~10 times/sec; reads the same
     /// live capture and registry the stream uses, so the panel shows exactly what
     /// is going out. The frame is native pixels (not resampled, I-1) — the panel
@@ -256,18 +278,19 @@ public final class HostSession: @unchecked Sendable {
     /// window layout but no pixels). Call on the main thread — it is not `Sendable`.
     public func preview() -> HostPreview {
         HostPreview(
-            image: capture?.latestImage(),
-            windows: registry?.snapshot() ?? [],
+            image: lanes.first?.capture?.latestImage(),
+            windows: lanes.first?.registry.snapshot() ?? [],
             displayPixelWidth: config.display.pixelWidth,
             displayPixelHeight: config.display.pixelHeight)
     }
 
     // MARK: - Lifecycle
 
-    /// Tile, start the AX watcher + control server, and (if `video`) the capture +
-    /// encoder + video server. Returns once everything is listening and the initial
-    /// registry is seeded, so a client connecting immediately gets a full resync.
-    /// Throws with a plain message if a permission or bind precondition fails.
+    /// Tile, start the AX watchers + control server, and (if `video`) each lane's
+    /// capture + encoder and the video server. Returns once everything is
+    /// listening and the initial registries are seeded, so a client connecting
+    /// immediately gets a full resync. Throws with a plain message if a permission
+    /// or bind precondition fails.
     public func start() async throws {
         do {
             try await startImpl()
@@ -283,95 +306,24 @@ public final class HostSession: @unchecked Sendable {
     private func startImpl() async throws {
         try preflight()
 
-        let disp = config.display
-        let registry = WindowRegistry()
-        self.registry = registry
-        let vdsSize = WireSize(w: UInt32(disp.pixelWidth), h: UInt32(disp.pixelHeight))
-
-        let targets = [config.target] + config.additionalTargets
-        if config.restoreWindows {
-            let report = await WindowRestorer.restore(pids: targets.map(\.pid))
-            if let summary = report.summary { statsLock.withLock { notices.append(summary) } }
-        }
-
-        // Tile once at startup so streamed windows are non-overlapping (I-5), and
-        // keep the requested-vs-actual placements for the Status view (I-4/OQ-2).
-        // Whatever does not fit is minimized rather than refusing the session,
-        // the same treatment a window opened mid-session gets.
-        if config.tile {
-            switch TileService.admit(pids: targets.map(\.pid), display: disp, gutter: config.gutter) {
-            case .success(let admission):
-                statsLock.withLock { tilePlacements = admission.placements }
-                if !admission.overflow.isEmpty {
-                    let notice = Self.overflowNotice(admission.overflow)
-                    Log.ax.notice("tile: \(notice, privacy: .public)")
-                    statsLock.withLock { notices.append(notice) }
-                }
-            case .failure(let error):
-                statsLock.withLock { tileError = error.description }
-                throw ProbeError("The selected windows do not fit on the sharing display. Choose fewer apps or a larger display. \(error.description)")
-            }
-        }
-
-        // Control channel: AX events -> ordered broadcast via one AsyncStream.
-        let (events, eventSink) = AsyncStream.makeStream(of: WindowWatcher.WindowEvent.self)
+        let ids = WindowIDSource()
+        let (events, eventSink) = AsyncStream.makeStream(
+            of: (lane: UInt32, event: WindowWatcher.WindowEvent).self)
         self.eventSink = eventSink
-        let watchers = targets.map { target in
-            let watcher = WindowWatcher(pid: target.pid, display: disp, registry: registry,
-                appName: target.name)
-            watcher.onEvent = { event in eventSink.yield(event) }
-            if config.tile {
-                // Long enough for the layout guard below to notice a window that
-                // left the display and bring it back before its proxy is closed.
-                watcher.offDisplayGrace = 3
-                let pids = targets.map(\.pid)
-                let gutter = config.gutter
-                watcher.prepareNewWindow = { [weak self] element in
-                    switch TileService.layout(pids: pids, display: disp, gutter: gutter, fit: true) {
-                    case .success(let placements):
-                        self?.statsLock.withLock { self?.tilePlacements = placements; self?.tileError = nil }
-                        return true
-                    case .failure(let error):
-                        // Keep a rejected new document from covering another
-                        // shared crop. The document remains open and can be restored.
-                        let minimized = AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
-                        let message = minimized == .success
-                            ? "The new window does not fit on the sharing display and was minimized. Share fewer apps, then restore it on the Mac."
-                            : "The new window does not fit and could not be minimized. Stop sharing and choose fewer apps."
-                        self?.statsLock.withLock { self?.tileError = error.description }
-                        eventSink.yield(.sharingFailed(message: message))
-                        return false
-                    }
-                }
-            }
-            return watcher
+
+        for (index, laneConfig) in config.lanes.enumerated() {
+            lanes.append(
+                try await makeLane(
+                    id: UInt32(index), config: laneConfig, registry: WindowRegistry(ids: ids),
+                    emit: { lane, event in eventSink.yield((lane, event)) }))
         }
-        self.watchers = watchers
-
-        // Phase 4 (issue #6): the geometry roundtrip. Client RequestResize is
-        // throttled (~10Hz), written to AX, read back, and emitted as windowMoved
-        // (ACTUAL geometry, I-4) through the same ordered event stream, so both this
-        // CLI and the host app get resize for free.
-        let resize = ResizeService(
-            registry: registry, display: disp, gutter: config.gutter,
-            emit: { event in eventSink.yield(event) })
-
-        // Phase 5 (issue #7): input injection. Client Input/RequestFocus become
-        // CGEvents, translating window-local pixels through the one coordinate
-        // function (I-3). Modifier mapping is the Cmd-vs-Ctrl decision (default
-        // swaps Ctrl→Command). `inputDelivery` decides whether they reach the
-        // window in place or by raising it. Shared by the CLI and the host app.
-        let injector = InputInjector(
-            display: disp, registry: registry,
-            modifierMap: config.namesakeModifiers ? .namesake : .swap,
-            delivery: config.inputDelivery)
-        if config.logInput { injector.onTrace = { line in print("  \(line)") } }
-        self.injector = injector
+        let lanes = self.lanes
 
         let (clientMessages, clientSink) = AsyncStream.makeStream(of: ClientMessage.self)
         self.clientSink = clientSink
 
-        let controlServer = ControlServer(vdsSize: vdsSize, registry: registry)
+        let controlServer = ControlServer(
+            lanes: lanes.map { .init(id: $0.id, vdsSize: $0.vdsSize, registry: $0.registry) })
         self.controlServer = controlServer
         await controlServer.setOnClientMessage { message in clientSink.yield(message) }
         await controlServer.setOnConnectionChange { [weak self] connected in
@@ -379,23 +331,25 @@ public final class HostSession: @unchecked Sendable {
             // A dropped client leaves no modifier or button held for the next one
             // (issue #7), and no shared app still believing it is the active one.
             if !connected {
-                injector.reset()
-                injector.releaseFocus()
+                for lane in lanes {
+                    lane.injector.reset()
+                    lane.injector.releaseFocus()
+                }
             }
         }
         let controlListener = try TCPListener(
             host: config.host, port: config.controlPort, label: "control")
         self.controlListener = controlListener
 
-        // Start the AX watcher on its own run-loop thread and wait until it has
-        // registered + seeded the registry (same handshake the CLI used).
+        // Start every lane's AX watchers on one run-loop thread and wait until they
+        // have registered + seeded the registries (same handshake the CLI used).
         let ctx = WatcherThreadBox()
-        let layoutGuard = config.tile ? LayoutGuardBox() : nil
-        let pids = targets.map(\.pid)
+        let tile = config.tile
         let gutter = config.gutter
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let watcherThread = Thread { [weak self] in
                 ctx.runLoop = CFRunLoopGetCurrent()
+                let watchers = lanes.flatMap(\.watchers)
                 do {
                     for watcher in watchers { try watcher.start() }
                     cont.resume()
@@ -407,28 +361,13 @@ public final class HostSession: @unchecked Sendable {
                 // The startup tile only holds until something on the Mac moves or
                 // resizes a window (a streamed title-bar drag, a zoom). Re-tile
                 // once such a change has settled into an overlap (I-5).
-                let layoutTimer = layoutGuard.map { layoutGuard in
-                    Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                        let result = TileService.enforceNonOverlap(
-                            &layoutGuard.state, pids: pids, display: disp, gutter: gutter,
-                            pointerDown: injector.isPointerDown)
-                        switch result {
-                        case .success(let placements):
-                            Log.ax.notice("layout: re-tiled after a Mac-side geometry change")
-                            self?.statsLock.withLock {
-                                self?.tilePlacements = placements
-                                self?.tileError = nil
-                            }
-                        case .failure(let error):
-                            Log.ax.notice(
-                                "layout: could not restore non-overlap: \(error.description, privacy: .public)"
-                            )
-                            self?.statsLock.withLock { self?.tileError = error.description }
-                        case nil:
-                            break
+                let layoutTimer =
+                    tile
+                    ? Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                        for lane in lanes {
+                            self?.enforceLayout(lane, gutter: gutter)
                         }
-                    }
-                }
+                    } : nil
                 if let layoutTimer { RunLoop.current.add(layoutTimer, forMode: .default) }
                 CFRunLoopRun()
                 layoutTimer?.invalidate()
@@ -442,25 +381,31 @@ public final class HostSession: @unchecked Sendable {
         tasks.append(Task { await controlServer.serve(listener: controlListener) })
         tasks.append(
             Task {
-                for await event in events { await controlServer.broadcast(event) }
+                for await item in events { await controlServer.broadcast(item.event, lane: item.lane) }
             })
-        // Drive resize requests in arrival order (AX writes serialise on the actor),
-        // and tick at ~20Hz so a coalesced live from a paused drag still flushes.
+        // Drive client requests in arrival order (AX writes serialise on each
+        // lane's resize actor), routed to the lane that owns the window, and tick
+        // at ~20Hz so a coalesced live from a paused drag still flushes.
         tasks.append(
             Task {
+                func lane(owning id: UInt64) -> Lane? {
+                    lanes.first { $0.registry.element(for: id) != nil }
+                }
                 for await message in clientMessages {
                     switch message {
                     case let .requestResize(id, size, phase):
-                        await resize.handle(id: id, size: size, phase: phase)
-                    case .input, .requestFocus:
-                        injector.handle(message)
+                        await lane(owning: id)?.resize.handle(id: id, size: size, phase: phase)
+                    case let .input(id, _, _), let .requestFocus(id):
+                        lane(owning: id)?.injector.handle(message)
                     case let .requestClose(id):
-                        injector.close(id: id)
-                    case .requestKeyframe:
+                        lane(owning: id)?.injector.close(id: id)
+                    case let .requestKeyframe(laneID):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
                         // chain at the next encoded frame.
-                        encoder?.requestKeyframe()
+                        for lane in lanes where laneID == nil || lane.id == laneID {
+                            lane.encoder?.requestKeyframe()
+                        }
                     }
                 }
             })
@@ -468,13 +413,13 @@ public final class HostSession: @unchecked Sendable {
             Task {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 50_000_000)
-                    await resize.tick()
+                    for lane in lanes { await lane.resize.tick() }
                 }
             })
         try await controlListener.start()
 
         if config.video {
-            try await startVideo(disp: disp, vdsSize: vdsSize)
+            try await startVideo(lanes)
             statsLock.withLock { videoEnabled = true }
         }
 
@@ -483,60 +428,188 @@ public final class HostSession: @unchecked Sendable {
         statsLock.withLock { isRunning = true }
     }
 
-    private func startVideo(disp: DisplayInfo, vdsSize: WireSize) async throws {
-        let enc = try HEVCEncoder(
-            config: HEVCEncoder.Config(
-                width: disp.pixelWidth, height: disp.pixelHeight, fps: config.fps,
-                bitrateBitsPerSecond: config.bitrateMbps * 1_000_000,
-                maxKeyFrameInterval: config.fps * 2, format: config.videoFormat))
-        enc.extractFrameData = true
-        self.encoder = enc
-        statsLock.withLock { usingHardware = enc.usingHardware }
+    /// One lane's AX side: restore and tile its windows, then build (not start)
+    /// its watchers, resize service and input injector.
+    private func makeLane(
+        id: UInt32, config laneConfig: LaneConfig, registry: WindowRegistry,
+        emit: @escaping @Sendable (UInt32, WindowWatcher.WindowEvent) -> Void
+    ) async throws -> Lane {
+        let disp = laneConfig.display
+        let targets = laneConfig.targets
+        let pids = targets.map(\.pid)
+        if config.restoreWindows {
+            let report = await WindowRestorer.restore(pids: pids)
+            if let summary = report.summary { statsLock.withLock { notices.append(summary) } }
+        }
 
-        let cap = DisplayCapture(display: disp, fps: config.fps,
-            applicationPIDs: Set(([config.target] + config.additionalTargets).map(\.pid)),
-            pixelFormat: config.videoFormat.capturePixelFormat,
-            // Background input never moves the Mac's cursor, so the one SCK would
-            // draw belongs to whoever is at the Mac, not to the client.
-            showsCursor: config.inputDelivery == .foreground)
-        self.capture = cap
+        // Tile once at startup so streamed windows are non-overlapping (I-5), and
+        // keep the requested-vs-actual placements for the Status view (I-4/OQ-2).
+        // Whatever does not fit is minimized rather than refusing the session,
+        // the same treatment a window opened mid-session gets.
+        if config.tile {
+            switch TileService.admit(pids: pids, display: disp, gutter: config.gutter) {
+            case .success(let admission):
+                statsLock.withLock { tilePlacements[id] = admission.placements }
+                if !admission.overflow.isEmpty {
+                    let notice = Self.overflowNotice(admission.overflow)
+                    Log.ax.notice("tile: \(notice, privacy: .public)")
+                    statsLock.withLock { notices.append(notice) }
+                }
+            case .failure(let error):
+                statsLock.withLock { tileError = error.description }
+                throw ProbeError("The selected windows do not fit on the sharing display. Choose fewer apps or a larger display. \(error.description)")
+            }
+        }
 
-        let videoServer = VideoServer(hvccProvider: { enc.parameterSetsHVCC })
+        let watchers = targets.map { target in
+            let watcher = WindowWatcher(pid: target.pid, display: disp, registry: registry,
+                appName: target.name)
+            watcher.onEvent = { event in emit(id, event) }
+            if config.tile {
+                // Long enough for the layout guard to notice a window that left
+                // the display and bring it back before its proxy is closed.
+                watcher.offDisplayGrace = 3
+                let gutter = config.gutter
+                watcher.prepareNewWindow = { [weak self] element in
+                    switch TileService.layout(pids: pids, display: disp, gutter: gutter, fit: true) {
+                    case .success(let placements):
+                        self?.statsLock.withLock { self?.tilePlacements[id] = placements; self?.tileError = nil }
+                        return true
+                    case .failure(let error):
+                        // Keep a rejected new document from covering another
+                        // shared crop. The document remains open and can be restored.
+                        let minimized = AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+                        let message = minimized == .success
+                            ? "The new window does not fit on the sharing display and was minimized. Share fewer apps, then restore it on the Mac."
+                            : "The new window does not fit and could not be minimized. Stop sharing and choose fewer apps."
+                        self?.statsLock.withLock { self?.tileError = error.description }
+                        emit(id, .sharingFailed(message: message))
+                        return false
+                    }
+                }
+            }
+            return watcher
+        }
+
+        // Phase 4 (issue #6): the geometry roundtrip. Client RequestResize is
+        // throttled (~10Hz), written to AX, read back, and emitted as windowMoved
+        // (ACTUAL geometry, I-4) through the same ordered event stream, so both this
+        // CLI and the host app get resize for free.
+        let resize = ResizeService(
+            registry: registry, display: disp, gutter: config.gutter,
+            emit: { event in emit(id, event) })
+
+        // Phase 5 (issue #7): input injection. Client Input/RequestFocus become
+        // CGEvents, translating window-local pixels through the one coordinate
+        // function (I-3). Modifier mapping is the Cmd-vs-Ctrl decision (default
+        // swaps Ctrl→Command). `inputDelivery` decides whether they reach the
+        // window in place or by raising it. Shared by the CLI and the host app.
+        let injector = InputInjector(
+            display: disp, registry: registry,
+            modifierMap: config.namesakeModifiers ? .namesake : .swap,
+            delivery: config.inputDelivery)
+        if config.logInput { injector.onTrace = { line in print("  \(line)") } }
+
+        return Lane(
+            id: id, targets: targets, display: disp, registry: registry, watchers: watchers,
+            resize: resize, injector: injector)
+    }
+
+    /// Re-tile a lane whose windows a Mac-side change left overlapping. Runs on
+    /// the watcher run-loop thread.
+    private func enforceLayout(_ lane: Lane, gutter: Int) {
+        let result = TileService.enforceNonOverlap(
+            &lane.layoutGuard, pids: lane.targets.map(\.pid), display: lane.display,
+            gutter: gutter, pointerDown: lane.injector.isPointerDown)
+        switch result {
+        case .success(let placements):
+            Log.ax.notice("layout: re-tiled lane \(lane.id, privacy: .public) after a Mac-side geometry change")
+            statsLock.withLock {
+                tilePlacements[lane.id] = placements
+                tileError = nil
+            }
+        case .failure(let error):
+            Log.ax.notice(
+                "layout: could not restore non-overlap: \(error.description, privacy: .public)"
+            )
+            statsLock.withLock { tileError = error.description }
+        case nil:
+            break
+        }
+    }
+
+    private func startVideo(_ lanes: [Lane]) async throws {
+        for lane in lanes {
+            let disp = lane.display
+            let enc = try HEVCEncoder(
+                config: HEVCEncoder.Config(
+                    width: disp.pixelWidth, height: disp.pixelHeight, fps: config.fps,
+                    bitrateBitsPerSecond: config.bitrateMbps * 1_000_000,
+                    maxKeyFrameInterval: config.fps * 2, format: config.videoFormat))
+            enc.extractFrameData = true
+            lane.encoder = enc
+            lane.capture = DisplayCapture(display: disp, fps: config.fps,
+                applicationPIDs: Set(lane.targets.map(\.pid)),
+                pixelFormat: config.videoFormat.capturePixelFormat,
+                // Background input never moves the Mac's cursor, so the one SCK would
+                // draw belongs to whoever is at the Mac, not to the client.
+                showsCursor: config.inputDelivery == .foreground)
+        }
+        let hardware = lanes.allSatisfy { $0.encoder?.usingHardware == true }
+        statsLock.withLock { usingHardware = hardware }
+
+        var providers: [UInt32: @Sendable () -> Data?] = [:]
+        for lane in lanes {
+            let enc = lane.encoder
+            providers[lane.id] = { enc?.parameterSetsHVCC }
+        }
+        let videoServer = VideoServer(hvccProviders: providers)
         self.videoServer = videoServer
-        await videoServer.setOnConnectionChange { [weak self, weak enc, weak cap] connected in
+        await videoServer.setOnConnectionChange { [weak self] connected in
             self?.statsLock.withLock { self?.videoConnected = connected }
             if connected {
-                enc?.requestKeyframe()
-                cap?.requestRefresh()
+                for lane in lanes {
+                    lane.encoder?.requestKeyframe()
+                    lane.capture?.requestRefresh()
+                }
             }
         }
         let listener = try TCPListener(host: config.host, port: config.videoPort, label: "video")
         self.videoListener = listener
 
-        let (frames, frameSink) = AsyncStream.makeStream(
-            of: HEVCEncoder.EncodedFrame.self, bufferingPolicy: .bufferingNewest(4))
-        enc.onEncodedFrame = { [weak self, weak enc] frame in
-            // Read the encoder directly instead of self.encoder on a VT thread;
-            // keep it weak so the callback does not retain its own encoder.
-            self?.recordEncodedFrame(frame, formatSummary: enc?.outputFormatSummary ?? "unknown")
-            frameSink.yield(frame)
-        }
-
         let frameDuration = CMTimeMake(value: 1, timescale: Int32(config.fps))
-        cap.onPixelBuffer = { [weak self] pixelBuffer, pts in
-            self?.markEncodeStart()
-            try? enc.encode(pixelBuffer, pts: pts, duration: frameDuration)
+        // One lane at a time: two captures starting at once in separate host
+        // processes hung in startCapture, so never overlap the starts.
+        for lane in lanes {
+            guard let enc = lane.encoder, let cap = lane.capture else { continue }
+            let laneID = lane.id
+            let (frames, frameSink) = AsyncStream.makeStream(
+                of: HEVCEncoder.EncodedFrame.self, bufferingPolicy: .bufferingNewest(4))
+            enc.onEncodedFrame = { [weak self, weak enc] frame in
+                // Read the encoder directly instead of the lane's on a VT thread;
+                // keep it weak so the callback does not retain its own encoder.
+                self?.recordEncodedFrame(
+                    frame, lane: laneID, formatSummary: enc?.outputFormatSummary ?? "unknown")
+                frameSink.yield(frame)
+            }
+            cap.onPixelBuffer = { [weak self] pixelBuffer, pts in
+                self?.markEncodeStart(lane: laneID)
+                try? enc.encode(pixelBuffer, pts: pts, duration: frameDuration)
+            }
+            try await cap.start()
+            tasks.append(Task { for await f in frames { await videoServer.send(f, lane: laneID) } })
         }
-        try await cap.start()
 
         try await listener.start()
         tasks.append(Task { await videoServer.serve(listener: listener) })
-        tasks.append(Task { for await f in frames { await videoServer.send(f) } })
+        let captures = lanes.compactMap(\.capture)
         tasks.append(Task {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .milliseconds(300)) }
                 catch { break }
-                if await videoServer.hasClient { cap.requestIdleRefresh() }
+                if await videoServer.hasClient {
+                    for cap in captures { cap.requestIdleRefresh() }
+                }
             }
         })
     }
@@ -547,29 +620,27 @@ public final class HostSession: @unchecked Sendable {
         videoListener?.stop()
         await controlServer?.stop()
         await videoServer?.stop()
-        if let capture { await capture.stop() }
-        injector?.releaseFocus()
-        encoder?.finish()
+        for lane in lanes {
+            if let capture = lane.capture { await capture.stop() }
+            lane.injector.releaseFocus()
+            lane.encoder?.finish()
+        }
         eventSink?.finish()
         clientSink?.finish()
         for task in tasks { task.cancel() }
-        // Stopping its run loop ends the watcher thread; the AXObserver and its
-        // source are released when the watcher deallocates below.
+        // Stopping its run loop ends the watcher thread; the AXObservers and their
+        // sources are released when the watchers deallocate below.
         if let runLoop = watcherRunLoop { CFRunLoopStop(runLoop) }
 
         tasks = []
-        registry = nil
-        watchers = []
+        lanes = []
         watcherRunLoop = nil
         controlListener = nil
         videoListener = nil
         controlServer = nil
         videoServer = nil
-        capture = nil
-        encoder = nil
         eventSink = nil
         clientSink = nil
-        injector = nil
 
         statsLock.withLock {
             isRunning = false
@@ -578,7 +649,7 @@ public final class HostSession: @unchecked Sendable {
             videoEnabled = false
             notices = []
             frameSamples = []
-            pendingEncodeStarts = []
+            pendingEncodeStarts = [:]
             latencySamplesMs = []
         }
     }
@@ -625,25 +696,27 @@ public final class HostSession: @unchecked Sendable {
 
     // MARK: - Stats (called from capture / VideoToolbox threads)
 
-    private func markEncodeStart() {
+    private func markEncodeStart(lane: UInt32) {
         let now = DispatchTime.now().uptimeNanoseconds
         statsLock.withLock {
-            pendingEncodeStarts.append(now)
+            pendingEncodeStarts[lane, default: []].append(now)
             // Bound the queue: if output ever lags input, drop the oldest so the
             // latency estimate stays fresh instead of drifting unboundedly.
-            if pendingEncodeStarts.count > 12 { pendingEncodeStarts.removeFirst() }
+            if pendingEncodeStarts[lane]!.count > 12 { pendingEncodeStarts[lane]!.removeFirst() }
         }
     }
 
-    private func recordEncodedFrame(_ frame: HEVCEncoder.EncodedFrame, formatSummary: String) {
+    private func recordEncodedFrame(
+        _ frame: HEVCEncoder.EncodedFrame, lane: UInt32, formatSummary: String
+    ) {
         let now = DispatchTime.now().uptimeNanoseconds
         statsLock.withLock {
             totalFrames += 1
             encoderFormatSummary = formatSummary
             frameSamples.append((t: now, bytes: frame.byteCount))
             trimRateWindowLocked()
-            if !pendingEncodeStarts.isEmpty {
-                let start = pendingEncodeStarts.removeFirst()
+            if let start = pendingEncodeStarts[lane]?.first {
+                pendingEncodeStarts[lane]!.removeFirst()
                 if now >= start {
                     latencySamplesMs.append(Double(now - start) / 1_000_000)
                     if latencySamplesMs.count > 60 { latencySamplesMs.removeFirst() }
@@ -675,13 +748,41 @@ public final class HostSession: @unchecked Sendable {
     }
 }
 
+/// One lane's pipeline. Its AX objects are fixed at creation; `capture` and
+/// `encoder` are set once by `startVideo`, and `layoutGuard` is touched only on
+/// the watcher run-loop thread.
+private final class Lane: @unchecked Sendable {
+    let id: UInt32
+    let targets: [TargetApp]
+    let display: DisplayInfo
+    let registry: WindowRegistry
+    let watchers: [WindowWatcher]
+    let resize: ResizeService
+    let injector: InputInjector
+    var capture: DisplayCapture?
+    var encoder: HEVCEncoder?
+    var layoutGuard = LayoutGuard()
+
+    var vdsSize: WireSize {
+        WireSize(w: UInt32(display.pixelWidth), h: UInt32(display.pixelHeight))
+    }
+
+    init(
+        id: UInt32, targets: [TargetApp], display: DisplayInfo, registry: WindowRegistry,
+        watchers: [WindowWatcher], resize: ResizeService, injector: InputInjector
+    ) {
+        self.id = id
+        self.targets = targets
+        self.display = display
+        self.registry = registry
+        self.watchers = watchers
+        self.resize = resize
+        self.injector = injector
+    }
+}
+
 /// Cross-thread handoff for the watcher run-loop thread's `CFRunLoop`, written on
 /// that thread before the continuation resumes, so the caller reads it safely.
 private final class WatcherThreadBox: @unchecked Sendable {
     var runLoop: CFRunLoop?
-}
-
-/// The layout guard's state, touched only on the watcher run-loop thread.
-private final class LayoutGuardBox: @unchecked Sendable {
-    var state = LayoutGuard()
 }

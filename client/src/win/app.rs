@@ -92,9 +92,9 @@ pub struct App {
     proxies: HashMap<u64, Proxy>,
     windows: HashMap<u64, Window>,
     hwnd_to_id: HashMap<isize, u64>,
-    source: Option<SourceTexture>,
-    decoder: Option<DecoderWorker>,
-    vds: Option<Size>,
+    /// One video pipeline per lane (protocol v2): its display size, the texture
+    /// its windows sample from, and its decoder.
+    lanes: HashMap<u32, LaneVideo>,
     cascade: u32,
     /// Latest unsent hover move per proxy. High-polling-rate mice can emit far
     /// more messages than the control channel or Mac cursor needs; one per pump
@@ -102,12 +102,29 @@ pub struct App {
     pending_mouse_moves: HashMap<u64, InputEvent>,
     reconnect_at: Option<Instant>,
     now_epoch: Instant,
+}
+
+/// One lane's video: its display, the texture its windows crop from, its decoder.
+struct LaneVideo {
+    vds: Size,
+    source: Option<SourceTexture>,
+    decoder: Option<DecoderWorker>,
     /// Video-health counters. If access units keep arriving but none ever decode
     /// (the tell-tale of the in-box HEVC decoder rejecting the host's 4:4:4 10-bit
     /// stream), we warn once instead of silently showing the placeholder forever.
     video_in: u64,
     video_decoded: u64,
     warned_no_decode: bool,
+}
+
+/// The texture a window samples from: its lane's.
+fn source_for<'a>(
+    lanes: &'a HashMap<u32, LaneVideo>,
+    windows: &HashMap<u64, Window>,
+    id: u64,
+) -> Option<&'a SourceTexture> {
+    let lane = windows.get(&id)?.lane;
+    lanes.get(&lane)?.source.as_ref()
 }
 
 impl App {
@@ -143,16 +160,11 @@ impl App {
             proxies: HashMap::new(),
             windows: HashMap::new(),
             hwnd_to_id: HashMap::new(),
-            source: None,
-            decoder: None,
-            vds: None,
+            lanes: HashMap::new(),
             cascade: 0,
             pending_mouse_moves: HashMap::new(),
             reconnect_at: None,
             now_epoch: Instant::now(),
-            video_in: 0,
-            video_decoded: 0,
-            warned_no_decode: false,
         }
     }
 
@@ -282,7 +294,7 @@ impl App {
                 n.clone()
             } else if self.cfg.video_port.is_none() {
                 "Control only · video is off".into()
-            } else if self.video_decoded > 0 {
+            } else if self.lanes.values().any(|l| l.video_decoded > 0) {
                 "Streaming".into()
             } else {
                 "Waiting for video…".into()
@@ -297,12 +309,7 @@ impl App {
             s.shutdown();
         }
         self.rx = None;
-        self.decoder = None;
-        self.source = None;
-        self.vds = None;
-        self.video_in = 0;
-        self.video_decoded = 0;
-        self.warned_no_decode = false;
+        self.lanes.clear();
         self.notice = None;
         self.video_notice = None;
         let ids: Vec<_> = self.proxies.keys().copied().collect();
@@ -411,9 +418,22 @@ impl App {
 
     fn apply_model_event(&mut self, ev: ModelEvent, _app_ptr: *mut App) {
         match ev {
-            ModelEvent::Connected { vds } => {
-                self.vds = Some(vds);
-                self.ensure_source(vds);
+            ModelEvent::Connected { lanes } => {
+                self.lanes.clear();
+                for lane in lanes {
+                    self.lanes.insert(
+                        lane.lane,
+                        LaneVideo {
+                            vds: lane.vds,
+                            source: None,
+                            decoder: None,
+                            video_in: 0,
+                            video_decoded: 0,
+                            warned_no_decode: false,
+                        },
+                    );
+                    self.ensure_source(lane.lane);
+                }
             }
             ModelEvent::WindowAdded(w) => {
                 self.windows.insert(w.id, w);
@@ -469,10 +489,10 @@ impl App {
 
     fn apply_video(&mut self, v: VideoEvent) {
         match v {
-            VideoEvent::Config { hvcc } => {
-                if let Some(vds) = self.vds {
-                    match DecoderWorker::start(hvcc, vds.w, vds.h) {
-                        Ok(d) => self.decoder = Some(d),
+            VideoEvent::Config { lane, hvcc } => {
+                if let Some(l) = self.lanes.get_mut(&lane) {
+                    match DecoderWorker::start(hvcc, l.vds.w, l.vds.h) {
+                        Ok(d) => l.decoder = Some(d),
                         Err(e) => {
                             self.video_notice = Some(format!("Cannot start video decoder: {e}"));
                             self.update_status();
@@ -481,36 +501,40 @@ impl App {
                 }
             }
             VideoEvent::Frame {
+                lane,
                 data,
                 keyframe,
                 pts_micros,
                 ..
             } => {
-                self.video_in += 1;
-                if self.video_in <= 3 {
+                let Some(l) = self.lanes.get_mut(&lane) else {
+                    return;
+                };
+                l.video_in += 1;
+                if l.video_in <= 3 {
                     eprintln!(
-                        "video: access unit {} ({} bytes, keyframe={keyframe})",
-                        self.video_in,
+                        "video: lane {lane} access unit {} ({} bytes, keyframe={keyframe})",
+                        l.video_in,
                         data.len()
                     );
                 }
-                if let Some(decoder) = self.decoder.as_ref() {
+                if let Some(decoder) = l.decoder.as_ref() {
                     decoder.submit(data, keyframe, pts_micros);
                 }
                 // A newly connected client must wait for a complete keyframe.
                 // Preserve any more specific error reported by the worker.
-                if !self.warned_no_decode
+                if !l.warned_no_decode
                     && self.notice.is_none()
                     && self.video_notice.is_none()
-                    && self.video_decoded == 0
-                    && self.video_in >= 120
+                    && l.video_decoded == 0
+                    && l.video_in >= 120
                 {
-                    self.warned_no_decode = true;
+                    l.warned_no_decode = true;
+                    let count = l.video_in;
                     self.video_notice=Some("Video is arriving but no picture has decoded yet. Waiting for a complete keyframe…".into());
                     self.update_status();
                     eprintln!(
-                        "video: received {} access units; waiting for a decodable keyframe",
-                        self.video_in
+                        "video: lane {lane} received {count} access units; waiting for a decodable keyframe"
                     );
                 }
             }
@@ -521,48 +545,66 @@ impl App {
     /// the D3D pixel shader performs the color conversion while each proxy window
     /// samples its own crop.
     fn poll_decoder(&mut self) {
-        let needs_keyframe = self
+        let mut ids: Vec<u32> = self.lanes.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            self.poll_lane_decoder(id);
+        }
+    }
+
+    fn poll_lane_decoder(&mut self, id: u32) {
+        let Some(lane) = self.lanes.get(&id) else {
+            return;
+        };
+        let needs_keyframe = lane
             .decoder
             .as_ref()
             .map(DecoderWorker::take_keyframe_request)
             .unwrap_or(false);
+        let error = lane.decoder.as_ref().and_then(DecoderWorker::take_error);
+        let frame = lane.decoder.as_ref().and_then(DecoderWorker::take_frame);
         if needs_keyframe {
-            self.send(&ClientMessage::RequestKeyframe);
+            self.send(&ClientMessage::RequestKeyframe { lane: Some(id) });
             self.video_notice = Some("Video fell behind; recovering…".into());
             self.update_status();
-            eprintln!("video: dropped stale frames; requested a fresh keyframe");
+            eprintln!("video: lane {id} dropped stale frames; requested a fresh keyframe");
         }
-        if let Some(error) = self.decoder.as_ref().and_then(DecoderWorker::take_error) {
+        if let Some(error) = error {
             self.video_notice = Some(error);
             self.update_status();
         }
-        let frame = self.decoder.as_ref().and_then(DecoderWorker::take_frame);
-        if let (Some(frame), Some(source)) = (frame, self.source.as_ref()) {
+        let Some(lane) = self.lanes.get_mut(&id) else {
+            return;
+        };
+        if let (Some(frame), Some(source)) = (frame, lane.source.as_ref()) {
             source.update_nv12(&self.gpu, &frame.nv12, frame.stride);
-            if let Some(vds) = self.vds {
-                self.dashboard
-                    .update_previews_nv12(&frame.nv12, frame.stride, vds);
-            }
-            self.video_decoded += 1;
+            self.dashboard
+                .update_previews_nv12(id, &frame.nv12, frame.stride, lane.vds);
+            lane.video_decoded += 1;
+            let first = lane.video_decoded == 1;
             let recovered = self.video_notice.take().is_some();
-            if self.video_decoded == 1 {
-                eprintln!("video: first decoded frame uploaded to the display texture");
+            if first {
+                eprintln!("video: lane {id} first decoded frame uploaded to its texture");
             }
-            if self.video_decoded == 1 || recovered {
+            if first || recovered {
                 self.update_status();
             }
         }
     }
 
-    fn ensure_source(&mut self, vds: Size) {
-        let need_new = match &self.source {
+    fn ensure_source(&mut self, id: u32) {
+        let Some(lane) = self.lanes.get_mut(&id) else {
+            return;
+        };
+        let vds = lane.vds;
+        let need_new = match &lane.source {
             Some(s) => s.width != vds.w || s.height != vds.h,
             None => true,
         };
         if need_new {
             match SourceTexture::new(&self.gpu, vds.w, vds.h) {
-                Ok(t) => self.source = Some(t),
-                Err(e) => eprintln!("source texture creation failed: {e}"),
+                Ok(t) => lane.source = Some(t),
+                Err(e) => eprintln!("lane {id} source texture creation failed: {e}"),
             }
         }
     }
@@ -763,10 +805,9 @@ impl App {
     }
 
     fn render_all(&mut self) {
-        let source = self.source.as_ref();
-        for proxy in self.proxies.values_mut() {
+        for (id, proxy) in self.proxies.iter_mut() {
             if unsafe { IsWindowVisible(proxy.hwnd).as_bool() && !IsIconic(proxy.hwnd).as_bool() } {
-                proxy.render(&self.gpu, source);
+                proxy.render(&self.gpu, source_for(&self.lanes, &self.windows, *id));
             }
         }
     }
@@ -800,7 +841,7 @@ impl App {
                         && h > 0
                         && !proxy.in_size_move
                         && (w != proxy.source.w || h != proxy.source.h);
-                    proxy.render(&self.gpu, self.source.as_ref());
+                    proxy.render(&self.gpu, source_for(&self.lanes, &self.windows, id));
                 }
                 if request {
                     self.send(&ClientMessage::RequestResize {
@@ -892,7 +933,7 @@ impl App {
             }
 
             WM_PAINT => {
-                let source = self.source.as_ref();
+                let source = source_for(&self.lanes, &self.windows, id);
                 if let Some(proxy) = self.proxies.get_mut(&id) {
                     proxy.render(&self.gpu, source);
                 }

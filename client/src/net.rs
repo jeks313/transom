@@ -87,7 +87,7 @@ pub fn send_message<W: Write>(w: &mut W, msg: &ClientMessage) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{ResizePhase, ServerMessage, Size};
+    use crate::wire::{Lane, ResizePhase, ServerMessage, Size};
     use std::io::Cursor;
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         // Two framed control messages back to back in one buffer.
         let mut stream = Vec::new();
         stream.extend_from_slice(&frame(
-            br#"{"type":"hello","protocol":1,"vdsSize":{"w":100,"h":100}}"#,
+            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":100,"h":100}}]}"#,
         ));
         stream.extend_from_slice(&frame(br#"{"type":"windowFocused","id":3}"#));
 
@@ -104,8 +104,11 @@ mod tests {
         assert_eq!(
             first,
             ServerMessage::Hello {
-                protocol: 1,
-                vds: Size { w: 100, h: 100 }
+                protocol: 2,
+                lanes: vec![Lane {
+                    lane: 0,
+                    vds: Size { w: 100, h: 100 }
+                }]
             }
         );
         let second = ServerMessage::decode(&rx.recv().unwrap().unwrap()).unwrap();

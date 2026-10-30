@@ -218,6 +218,7 @@ mod tests {
         let mut c = Card::new(
             Window {
                 id: 1,
+                lane: 0,
                 title: "x".into(),
                 kind: WindowKind::Normal,
                 source: Rect {

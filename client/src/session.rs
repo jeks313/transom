@@ -35,8 +35,9 @@ pub enum SessionEvent {
     VideoClosed(Option<String>),
 }
 
-/// Video-channel deliveries. `Config` carries the `hvcC` parameter sets the
-/// decoder must ingest first; `Frame` carries one HEVC access unit.
+/// Video-channel deliveries, each for one lane. `Config` carries the `hvcC`
+/// parameter sets the lane's decoder must ingest first; `Frame` carries one HEVC
+/// access unit.
 ///
 /// `seq`/`pts_micros` are retained for A/V correlation and drop detection even
 /// though the current decode path keys only off arrival order (protocol.md §6).
@@ -44,9 +45,11 @@ pub enum SessionEvent {
 #[allow(dead_code)]
 pub enum VideoEvent {
     Config {
+        lane: u32,
         hvcc: Vec<u8>,
     },
     Frame {
+        lane: u32,
         seq: u64,
         pts_micros: u64,
         keyframe: bool,
@@ -233,12 +236,18 @@ fn read_hello(stream: &mut TcpStream) -> std::io::Result<ServerMessage> {
     stream.read_exact(&mut payload)?;
     let hello = ServerMessage::decode(&payload)
         .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
-    match hello {
+    match &hello {
         ServerMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            vds,
-        } if vds.w > 0 && vds.h > 0 && vds.w <= 16384 && vds.h <= 16384 => Ok(hello),
-        ServerMessage::Hello { protocol, .. } if protocol != PROTOCOL_VERSION => Err(Error::new(
+            lanes,
+        } if !lanes.is_empty()
+            && lanes
+                .iter()
+                .all(|l| l.vds.w > 0 && l.vds.h > 0 && l.vds.w <= 16384 && l.vds.h <= 16384) =>
+        {
+            Ok(hello)
+        }
+        ServerMessage::Hello { protocol, .. } if *protocol != PROTOCOL_VERSION => Err(Error::new(
             ErrorKind::InvalidData,
             format!("Host protocol {protocol} is incompatible. Update Transom on both computers."),
         )),
@@ -254,15 +263,16 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>) {
     loop {
         match rx.recv() {
             Ok(Some(payload)) => match VideoMessage::decode(&payload) {
-                Ok(VideoMessage::Config { hvcc }) => {
+                Ok(VideoMessage::Config { lane, hvcc }) => {
                     if tx
-                        .send(SessionEvent::Video(VideoEvent::Config { hvcc }))
+                        .send(SessionEvent::Video(VideoEvent::Config { lane, hvcc }))
                         .is_err()
                     {
                         return;
                     }
                 }
                 Ok(VideoMessage::Frame {
+                    lane,
                     seq,
                     pts_micros,
                     keyframe,
@@ -270,6 +280,7 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>) {
                 }) => {
                     if tx
                         .send(SessionEvent::Video(VideoEvent::Frame {
+                            lane,
                             seq,
                             pts_micros,
                             keyframe,
@@ -311,7 +322,7 @@ mod tests {
             let (mut socket, _) = control.accept().unwrap();
             socket
                 .write_all(&crate::wire::frame::frame(
-                    br#"{"type":"hello","protocol":1,"vdsSize":{"w":800,"h":600}}"#,
+                    br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
                 ))
                 .unwrap();
             socket
@@ -322,7 +333,7 @@ mod tests {
         let video_thread = thread::spawn(move || {
             let (mut socket, _) = video.accept().unwrap();
             socket
-                .write_all(&crate::wire::frame::frame(&[1, 2, 3]))
+                .write_all(&crate::wire::frame::frame(&[1, 0, 0, 0, 0, 2, 3]))
                 .unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
@@ -351,9 +362,9 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut bytes = crate::wire::frame::frame(
-                br#"{"type":"hello","protocol":1,"vdsSize":{"w":800,"h":600}}"#,
+                br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
             );
-            bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
+            bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"lane":0,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
             s.write_all(&bytes).unwrap();
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             assert_eq!(s.read(&mut [0; 1]).unwrap(), 0);
@@ -374,8 +385,11 @@ mod tests {
     #[test]
     fn refuses_wrong_service_version_and_invalid_dimensions() {
         for payload in [
-            br#"{"type":"hello","protocol":2,"vdsSize":{"w":800,"h":600}}"#.as_slice(),
-            br#"{"type":"hello","protocol":1,"vdsSize":{"w":0,"h":600}}"#.as_slice(),
+            br#"{"type":"hello","protocol":1,"vdsSize":{"w":800,"h":600}}"#.as_slice(),
+            br#"{"type":"hello","protocol":3,"lanes":[]}"#.as_slice(),
+            br#"{"type":"hello","protocol":2,"lanes":[]}"#.as_slice(),
+            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":0,"h":600}}]}"#
+                .as_slice(),
             br#"{"type":"windowFocused","id":1}"#.as_slice(),
             b"HTTP/1.1 200 OK".as_slice(),
         ] {

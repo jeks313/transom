@@ -7,13 +7,25 @@ import Foundation
 /// Reconnect is a first-class requirement: if the client drops, the host keeps
 /// running (capture and AX never stop), and when the client reconnects it gets a
 /// **full resync** — `hello`, a `windowCreated` for every live window, and a
-/// `tileLayout` — from the registry, then resumes the live stream. No restart.
+/// `tileLayout` per lane — from the registries, then resumes the live stream. No
+/// restart.
 ///
 /// An actor so `broadcast` (driven from the event forwarding task) and the
 /// per-connection send/receive interleave safely without a lock.
 public actor ControlServer {
-    private let vdsSize: WireSize
-    private let registry: WindowRegistry
+    /// One per lane: its id, display size and the registry of its windows.
+    public struct Lane: Sendable {
+        public let id: UInt32
+        public let vdsSize: WireSize
+        public let registry: WindowRegistry
+        public init(id: UInt32, vdsSize: WireSize, registry: WindowRegistry) {
+            self.id = id
+            self.vdsSize = vdsSize
+            self.registry = registry
+        }
+    }
+
+    private let lanes: [Lane]
     private var active: (id: UUID, transport: any PacketTransport)?
     private var stopped = false
 
@@ -27,9 +39,13 @@ public actor ControlServer {
     /// from the actor; the closure must be thread-safe.
     public var onConnectionChange: (@Sendable (Bool) -> Void)?
 
+    public init(lanes: [Lane]) {
+        self.lanes = lanes
+    }
+
+    /// A one-lane server, as a session sharing a single display uses.
     public init(vdsSize: WireSize, registry: WindowRegistry) {
-        self.vdsSize = vdsSize
-        self.registry = registry
+        self.init(lanes: [Lane(id: 0, vdsSize: vdsSize, registry: registry)])
     }
 
     public func setOnClientMessage(_ handler: @escaping @Sendable (ClientMessage) -> Void) {
@@ -61,10 +77,11 @@ public actor ControlServer {
     /// Push one observed window event to the connected client, if any. On send
     /// failure the connection is dropped; the next reconnect resyncs from the
     /// registry, so nothing is left half-described.
-    public func broadcast(_ event: WindowWatcher.WindowEvent) async {
+    public func broadcast(_ event: WindowWatcher.WindowEvent, lane: UInt32 = 0) async {
         guard let active else { return }
         do {
-            try await active.transport.send(try WireCodec.encode(Self.message(for: event)))
+            try await active.transport.send(
+                try WireCodec.encode(Self.message(for: event, lane: lane)))
         } catch {
             Log.general.notice(
                 "control: send failed, dropping client: \(error.localizedDescription, privacy: .public)"
@@ -123,29 +140,37 @@ public actor ControlServer {
         await transport.close()
     }
 
-    /// hello + a windowCreated per live window + the current tile layout.
+    /// hello + a windowCreated per live window + each lane's tile layout.
     private func sendResync(to transport: any PacketTransport) async throws {
         try await transport.send(
             try WireCodec.encode(
-                .hello(protocolVersion: transomProtocolVersion, vdsSize: vdsSize)))
-        let entries = registry.snapshot()
-        for entry in entries {
+                .hello(
+                    protocolVersion: transomProtocolVersion,
+                    lanes: lanes.map { WireLane(lane: $0.id, vdsSize: $0.vdsSize) })))
+        for lane in lanes {
+            let entries = lane.registry.snapshot()
+            for entry in entries {
+                try await transport.send(
+                    try WireCodec.encode(
+                        .windowCreated(
+                            id: entry.id, lane: lane.id, rect: entry.rect, title: entry.title,
+                            kind: .normal)))
+            }
+            let windows = entries.map { WireWindow(id: $0.id, rect: $0.rect) }
             try await transport.send(
                 try WireCodec.encode(
-                    .windowCreated(
-                        id: entry.id, rect: entry.rect, title: entry.title, kind: .normal)))
+                    .tileLayout(lane: lane.id, windows: windows, displaySize: lane.vdsSize)))
         }
-        let windows = entries.map { WireWindow(id: $0.id, rect: $0.rect) }
-        try await transport.send(
-            try WireCodec.encode(.tileLayout(windows: windows, displaySize: vdsSize)))
     }
 
-    private static func message(for event: WindowWatcher.WindowEvent) -> ControlMessage {
+    private static func message(for event: WindowWatcher.WindowEvent, lane: UInt32)
+        -> ControlMessage
+    {
         switch event {
         case .sharingFailed(let message):
             return .error(code: 2, message: message)
         case .created(let id, let rect, let title):
-            return .windowCreated(id: id, rect: rect, title: title, kind: .normal)
+            return .windowCreated(id: id, lane: lane, rect: rect, title: title, kind: .normal)
         case .moved(let id, let rect):
             return .windowMoved(id: id, rect: rect)
         case .destroyed(let id):

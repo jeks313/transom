@@ -51,8 +51,8 @@ struct VideoServerTests {
             await server.send(frame(keyframe: true))
             let messages = await transport.messages
             try #require(messages.count == 2)
-            #expect(VideoWire.decode(messages[0]) == .config(hvcc: config))
-            if case .frame(_, _, let keyframe, _)? = VideoWire.decode(messages[1]) {
+            #expect(VideoWire.decode(messages[0]) == .config(lane: 0, hvcc: config))
+            if case .frame(_, _, _, let keyframe, _)? = VideoWire.decode(messages[1]) {
                 #expect(keyframe)
             } else {
                 Issue.record("Expected a keyframe after config")
@@ -62,6 +62,30 @@ struct VideoServerTests {
             await transport.close()
             await connection.value
         }
+    }
+
+    @Test("each lane gets its own config and keyframe gate on one connection")
+    func lanesAreIndependent() async throws {
+        let server = VideoServer(hvccProviders: [0: { Data([0]) }, 1: { Data([1]) }])
+        let transport = RecordingVideoTransport()
+        let connection = Task { await server.serveConnection(transport) }
+        defer { connection.cancel() }
+        try await waitForConnection(transport)
+        await server.send(frame(keyframe: true), lane: 0)
+        // Lane 1 has had no keyframe yet, so its delta is held back.
+        await server.send(frame(keyframe: false), lane: 1)
+        await server.send(frame(keyframe: true), lane: 1)
+        await server.send(frame(keyframe: false), lane: 0)
+        let decoded = await transport.messages.compactMap(VideoWire.decode)
+        let shape = decoded.map { message -> String in
+            switch message {
+            case .config(let lane, _): return "config\(lane)"
+            case .frame(let lane, let seq, _, let key, _): return "\(key ? "key" : "delta")\(lane)#\(seq)"
+            }
+        }
+        #expect(shape == ["config0", "key0#0", "config1", "key1#0", "delta0#1"])
+        await transport.close()
+        await connection.value
     }
 
     @Test("frames cannot precede missing configuration")

@@ -1,6 +1,6 @@
 # Transom: Wire Protocol
 
-**Status:** v1, **implemented on the host** (issue #3). The control channel and
+**Status:** v2 (lanes), **implemented on the host and the client**. The control channel and
 the video channel described here are what `transom-host serve` actually speaks.
 This is now a spec to code against, not a sketch. If you change a shape, change
 the host (`Sources/TransomKit/WireProtocol.swift`) and this file in the same
@@ -26,6 +26,22 @@ sockets.
 |---|---|---|---|
 | **Control** | TCP | 47100 | Ordered, reliable. Window lifecycle, geometry, input |
 | **Video** | TCP | 47101 | Lowest latency achievable on TCP. Frames may be dropped, never delayed |
+
+### Lanes (v2)
+
+A session shares one or more **lanes**. A lane is an app (or a group of apps) on
+its own virtual display, with its own capture and encoder. Every lane travels over
+the same two connections: `hello` lists the lanes, `windowCreated` and
+`tileLayout` name the lane a window is on, and every video message names its lane.
+Window ids are unique across lanes, so every other message carries only the id.
+Lane ids are small integers starting at 0; lane 0 always exists.
+
+One process holding every lane also avoids a macOS 26 failure: a capture started
+while another host process is capturing can hang in `startCapture`. The host bounds
+each start and retries it on a fresh stream.
+
+`serve` takes extra lanes with `--lane APP[,APP...][=WIDTHxHEIGHT]` (size in points,
+default `--display-size`); each gets a display of its own.
 
 > **Deployment note (measured, issue #6):** macOS's **AirPlay Receiver listens on
 > port 7000** (`ControlCenter`, on all interfaces). Transom intentionally defaults
@@ -127,21 +143,22 @@ Every message is a flat JSON object with a `"type"` discriminator and the fields
 below — *not* a nested/enum encoding, so any language decodes it trivially. Field
 names are exact. `u64` ids are JSON numbers (the client is Rust; no 2^53 issue).
 
-On connect (and on every reconnect) the host sends, in order: **`hello`**, one
-**`windowCreated`** per live window, then a **`tileLayout`** — a full resync — and
-then streams live events. The host keeps running if the client drops; a
+On connect (and on every reconnect) the host sends, in order: **`hello`**, then for
+each lane one **`windowCreated`** per live window and that lane's **`tileLayout`** —
+a full resync — and then streams live events. A `tileLayout` prunes only windows of
+its own lane. The host keeps running if the client drops; a
 reconnecting client gets the full resync again.
 
 ### Host -> Client
 
 ```
-hello          { protocol: u32, vdsSize: Size }         // first message; version + display size
-windowCreated  { id: u64, rect: Rect, title: String, kind: WindowKind }
+hello          { protocol: 2, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
+windowCreated  { id: u64, lane: u32, rect: Rect, title: String, kind: WindowKind }
 windowDestroyed{ id: u64 }
 windowMoved    { id: u64, rect: Rect }                  // ACTUAL geometry, see I-4
 windowTitle    { id: u64, title: String }
 windowFocused  { id: u64 }
-tileLayout     { windows: [{ id: u64, rect: Rect }], displaySize: Size }
+tileLayout     { lane: u32, windows: [{ id: u64, rect: Rect }], displaySize: Size }
 error          { code: u32, message: String }
 ```
 
@@ -169,8 +186,13 @@ is authoritative here; this line was corrected to match it — AGENTS.md.)
 requestResize  { id: u64, size: Size, phase: ResizePhase }
 requestFocus   { id: u64 }
 requestClose   { id: u64 }
+requestKeyframe{ lane?: u32 }                           // omitted lane = every lane
 input          { id: u64, event: InputEvent, ts: u64 }
 ```
+
+The host routes each request to the lane that owns the window `id`. Rects stay in
+the VDS of that window's lane. A v1 peer is refused at `hello` (the client reports
+"Update Transom on both computers").
 
 `ResizePhase` is `Begin | Live | End`, mapping to `WM_ENTERSIZEMOVE` /
 `WM_SIZING` / `WM_EXITSIZEMOVE`. The host throttles `Live` to ~10Hz and treats
@@ -343,13 +365,16 @@ The video channel is **binary**, length-prefixed like the control channel (§1),
 but the payload is not JSON. The first payload byte is a type tag:
 
 ```
-0x01  config   : hvcC ...                          // HEVC parameter sets (VPS/SPS/PPS)
-0x02  frame    : seq:u64  ptsMicros:u64  flags:u8  hevc...   // one access unit
+0x01  config   : lane:u32  hvcC ...                          // HEVC parameter sets (VPS/SPS/PPS)
+0x02  frame    : lane:u32  seq:u64  ptsMicros:u64  flags:u8  hevc...   // one access unit
                  flags bit0 = keyframe.  integers big-endian.
 ```
 
-- **`config` is sent first**, before the first keyframe, and again after a
-  reconnect. An `hvc1` stream carries no inline parameter sets, so the decoder
+Each lane is an independent stream: its own config, keyframe gate and `seq`. The
+client keeps one decoder and one texture per lane.
+
+- **A lane's `config` is sent first**, before its first keyframe, and again after
+  a reconnect. An `hvc1` stream carries no inline parameter sets, so the decoder
   needs the `hvcC` configuration record before it can decode anything.
   A video connection requests a fresh keyframe and a native-size capture
   refresh, including when the display is idle. The server suppresses deltas
@@ -453,6 +478,7 @@ Still deferred:
 - **Clipboard.** Wanted eventually, not now.
 - **Audio.** Later, if ever.
 - **Multiple hosts or clients.** One to one; the host serves one client at a time.
+  Several apps on separate displays share it as lanes (§1).
 
 Reconnect and state resync are **implemented** (§4): the host keeps running when
 the client drops, and a reconnecting client gets a full resync.
@@ -463,5 +489,5 @@ the client drops, and a reconnecting client gets a full resync.
 view only when selected; hiding that view sends no `requestClose`. App names
 may prefix titles. Native Windows caption/frame pixels are excluded from the
 streamed client area and input coordinates. A move-only gesture emits no
-`requestResize`; Begin/Live/End are reserved for size changes. Existing v1 hosts
-continue to work with the selector. Multiple shared apps require the newer host.
+`requestResize`; Begin/Live/End are reserved for size changes. The selector lists
+every lane's windows.

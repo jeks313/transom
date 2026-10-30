@@ -72,6 +72,46 @@ struct ServerShutdownTests {
         #expect(changes.values == [true, false])
     }
 
+    @Test("resync describes every lane, each window under its own lane")
+    func multiLaneResync() async throws {
+        let ids = WindowIDSource()
+        let first = WindowRegistry(ids: ids), second = WindowRegistry(ids: ids)
+        first.record(id: 1, rect: WireRect(x: 0, y: 0, w: 10, h: 10), title: "a")
+        second.record(id: 2, rect: WireRect(x: 5, y: 5, w: 20, h: 20), title: "b")
+        let server = ControlServer(lanes: [
+            .init(id: 0, vdsSize: WireSize(w: 100, h: 100), registry: first),
+            .init(id: 1, vdsSize: WireSize(w: 200, h: 100), registry: second),
+        ])
+        let transport = ShutdownTransport()
+        let connection = Task { await server.serveConnection(transport) }
+        defer { connection.cancel() }
+        try await transport.waitForReceive()
+        let messages = try await transport.messages.map(WireCodec.decodeControl)
+        #expect(
+            messages == [
+                .hello(
+                    protocolVersion: transomProtocolVersion,
+                    lanes: [
+                        WireLane(lane: 0, vdsSize: WireSize(w: 100, h: 100)),
+                        WireLane(lane: 1, vdsSize: WireSize(w: 200, h: 100)),
+                    ]),
+                .windowCreated(
+                    id: 1, lane: 0, rect: WireRect(x: 0, y: 0, w: 10, h: 10), title: "a",
+                    kind: .normal),
+                .tileLayout(
+                    lane: 0, windows: [WireWindow(id: 1, rect: WireRect(x: 0, y: 0, w: 10, h: 10))],
+                    displaySize: WireSize(w: 100, h: 100)),
+                .windowCreated(
+                    id: 2, lane: 1, rect: WireRect(x: 5, y: 5, w: 20, h: 20), title: "b",
+                    kind: .normal),
+                .tileLayout(
+                    lane: 1, windows: [WireWindow(id: 2, rect: WireRect(x: 5, y: 5, w: 20, h: 20))],
+                    displaySize: WireSize(w: 200, h: 100)),
+            ])
+        await server.stop()
+        await connection.value
+    }
+
     @Test("video stop closes the client and rejects queued connections")
     func videoStop() async throws {
         let server = VideoServer(hvccProvider: { nil })

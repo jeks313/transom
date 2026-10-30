@@ -28,20 +28,23 @@ public final class WindowRegistry: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private var nextID: UInt64 = 1
+    private let ids: WindowIDSource
     private var idByElement: [ElementKey: UInt64] = [:]
     private var elementByID: [UInt64: AXUIElement] = [:]
     private var entries: [UInt64: Entry] = [:]
 
-    public init() {}
+    /// - Parameter ids: where ids come from. Lanes of one session share a source,
+    ///   so an id is unique across the whole connection (protocol.md §3).
+    public init(ids: WindowIDSource = WindowIDSource()) {
+        self.ids = ids
+    }
 
     /// The id for this element, minting a fresh one the first time it is seen.
     public func id(for element: AXUIElement) -> (id: UInt64, isNew: Bool) {
         lock.withLock {
             let key = ElementKey(element: element)
             if let existing = idByElement[key] { return (existing, false) }
-            let id = nextID
-            nextID += 1
+            let id = ids.next()
             idByElement[key] = id
             elementByID[id] = element
             return (id, true)
@@ -93,5 +96,20 @@ public final class WindowRegistry: @unchecked Sendable {
     /// client's resync.
     public func snapshot() -> [Entry] {
         lock.withLock { entries.values.sorted { $0.id < $1.id } }
+    }
+}
+
+/// Mints window ids, starting at 1. Thread-safe; shared by every lane's registry.
+public final class WindowIDSource: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextID: UInt64 = 1
+
+    public init() {}
+
+    public func next() -> UInt64 {
+        lock.withLock {
+            defer { nextID += 1 }
+            return nextID
+        }
     }
 }

@@ -49,6 +49,18 @@ public struct WireWindow: Codable, Equatable, Sendable {
     }
 }
 
+/// One lane of a session: an app (or group of apps) on its own virtual display,
+/// captured and encoded on its own (protocol.md §1, v2). Window rects are in the
+/// VDS of the window's lane, and video frames carry the lane they belong to.
+public struct WireLane: Codable, Equatable, Sendable {
+    public var lane: UInt32
+    public var vdsSize: WireSize
+    public init(lane: UInt32, vdsSize: WireSize) {
+        self.lane = lane
+        self.vdsSize = vdsSize
+    }
+}
+
 /// What kind of surface a window is. The client must not give a menu a resizable
 /// frame or an Alt-Tab entry, so the taxonomy travels on the wire.
 public enum WindowKind: String, Codable, Sendable {
@@ -68,21 +80,23 @@ public enum ResizePhase: String, Codable, Sendable {
 }
 
 /// The protocol version carried in `hello`. Bump on any breaking wire change.
-public let transomProtocolVersion = 1
+public let transomProtocolVersion = 2
 
 // MARK: - Host -> Client
 
 public enum ControlMessage: Sendable, Equatable {
-    /// First message on a fresh control connection: version + the full virtual
-    /// display size, so the client can sanity-check every rect it receives.
-    case hello(protocolVersion: Int, vdsSize: WireSize)
-    case windowCreated(id: UInt64, rect: WireRect, title: String, kind: WindowKind)
+    /// First message on a fresh control connection: version + every lane and its
+    /// virtual display size, so the client can sanity-check every rect it receives.
+    case hello(protocolVersion: Int, lanes: [WireLane])
+    /// `lane` says which display (and video stream) the window is on. Ids are
+    /// unique across lanes, so later messages carry only the id.
+    case windowCreated(id: UInt64, lane: UInt32, rect: WireRect, title: String, kind: WindowKind)
     /// ACTUAL geometry after an AX write or an observed move (I-4), never requested.
     case windowMoved(id: UInt64, rect: WireRect)
     case windowDestroyed(id: UInt64)
     case windowTitle(id: UInt64, title: String)
     case windowFocused(id: UInt64)
-    case tileLayout(windows: [WireWindow], displaySize: WireSize)
+    case tileLayout(lane: UInt32, windows: [WireWindow], displaySize: WireSize)
     case error(code: UInt32, message: String)
 }
 
@@ -92,8 +106,9 @@ public enum ClientMessage: Sendable, Equatable {
     case requestResize(id: UInt64, size: WireSize, phase: ResizePhase)
     case requestFocus(id: UInt64)
     case requestClose(id: UInt64)
-    /// The client dropped stale compressed frames and needs a new intra frame.
-    case requestKeyframe
+    /// The client dropped stale compressed frames and needs a new intra frame on
+    /// `lane`, or on every lane when nil.
+    case requestKeyframe(lane: UInt32?)
     /// A click/type/scroll targeted at window `id` (issue #7). `event` carries
     /// window-local physical pixels / Windows VK codes (see `InputEvent`); `ts` is
     /// the client's monotonic timestamp in milliseconds, opaque to the host in v1.
@@ -104,21 +119,22 @@ public enum ClientMessage: Sendable, Equatable {
 
 extension ControlMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, rect, title, kind, windows, displaySize
+        case type, id, lane, rect, title, kind, windows, displaySize
         case protocolVersion = "protocol"
-        case vdsSize, code, message
+        case lanes, code, message
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Key.self)
         switch self {
-        case .hello(let version, let vdsSize):
+        case .hello(let version, let lanes):
             try c.encode("hello", forKey: .type)
             try c.encode(version, forKey: .protocolVersion)
-            try c.encode(vdsSize, forKey: .vdsSize)
-        case .windowCreated(let id, let rect, let title, let kind):
+            try c.encode(lanes, forKey: .lanes)
+        case .windowCreated(let id, let lane, let rect, let title, let kind):
             try c.encode("windowCreated", forKey: .type)
             try c.encode(id, forKey: .id)
+            try c.encode(lane, forKey: .lane)
             try c.encode(rect, forKey: .rect)
             try c.encode(title, forKey: .title)
             try c.encode(kind, forKey: .kind)
@@ -136,8 +152,9 @@ extension ControlMessage: Codable {
         case .windowFocused(let id):
             try c.encode("windowFocused", forKey: .type)
             try c.encode(id, forKey: .id)
-        case .tileLayout(let windows, let displaySize):
+        case .tileLayout(let lane, let windows, let displaySize):
             try c.encode("tileLayout", forKey: .type)
+            try c.encode(lane, forKey: .lane)
             try c.encode(windows, forKey: .windows)
             try c.encode(displaySize, forKey: .displaySize)
         case .error(let code, let message):
@@ -154,10 +171,11 @@ extension ControlMessage: Codable {
         case "hello":
             self = .hello(
                 protocolVersion: try c.decode(Int.self, forKey: .protocolVersion),
-                vdsSize: try c.decode(WireSize.self, forKey: .vdsSize))
+                lanes: try c.decode([WireLane].self, forKey: .lanes))
         case "windowCreated":
             self = .windowCreated(
                 id: try c.decode(UInt64.self, forKey: .id),
+                lane: try c.decode(UInt32.self, forKey: .lane),
                 rect: try c.decode(WireRect.self, forKey: .rect),
                 title: try c.decode(String.self, forKey: .title),
                 kind: try c.decode(WindowKind.self, forKey: .kind))
@@ -175,6 +193,7 @@ extension ControlMessage: Codable {
             self = .windowFocused(id: try c.decode(UInt64.self, forKey: .id))
         case "tileLayout":
             self = .tileLayout(
+                lane: try c.decode(UInt32.self, forKey: .lane),
                 windows: try c.decode([WireWindow].self, forKey: .windows),
                 displaySize: try c.decode(WireSize.self, forKey: .displaySize))
         case "error":
@@ -190,7 +209,7 @@ extension ControlMessage: Codable {
 
 extension ClientMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, size, phase, event, ts
+        case type, id, lane, size, phase, event, ts
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -207,8 +226,9 @@ extension ClientMessage: Codable {
         case .requestClose(let id):
             try c.encode("requestClose", forKey: .type)
             try c.encode(id, forKey: .id)
-        case .requestKeyframe:
+        case .requestKeyframe(let lane):
             try c.encode("requestKeyframe", forKey: .type)
+            try c.encodeIfPresent(lane, forKey: .lane)
         case .input(let id, let event, let ts):
             try c.encode("input", forKey: .type)
             try c.encode(id, forKey: .id)
@@ -231,7 +251,7 @@ extension ClientMessage: Codable {
         case "requestClose":
             self = .requestClose(id: try c.decode(UInt64.self, forKey: .id))
         case "requestKeyframe":
-            self = .requestKeyframe
+            self = .requestKeyframe(lane: try c.decodeIfPresent(UInt32.self, forKey: .lane))
         case "input":
             self = .input(
                 id: try c.decode(UInt64.self, forKey: .id),
@@ -287,27 +307,32 @@ public enum WireCodec {
 /// per-frame at 60fps, so JSON would be wrong here: each framed message on the
 /// video transport is one of these, distinguished by a leading type byte.
 ///
-/// - `config` (0x01): the HEVC `hvcC` parameter sets. Sent once before the first
-///   frame (and again after a reconnect), because an `hvc1` stream carries no
-///   inline parameter sets and the decoder needs them first.
-/// - `frame` (0x02): `seq: u64` · `ptsMicros: u64` · `flags: u8` (bit0 = keyframe)
-///   · the HEVC access-unit bytes. All integers big-endian.
+/// Every message names its lane right after the type byte, so one connection
+/// carries every lane's stream (v2).
+///
+/// - `config` (0x01): `lane: u32` · the HEVC `hvcC` parameter sets. Sent once per
+///   lane before its first frame (and again after a reconnect), because an `hvc1`
+///   stream carries no inline parameter sets and the decoder needs them first.
+/// - `frame` (0x02): `lane: u32` · `seq: u64` · `ptsMicros: u64` · `flags: u8`
+///   (bit0 = keyframe) · the HEVC access-unit bytes. All integers big-endian.
 public enum VideoWire {
     public enum Message: Equatable, Sendable {
-        case config(hvcc: Data)
-        case frame(seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data)
+        case config(lane: UInt32, hvcc: Data)
+        case frame(lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data)
     }
 
-    public static func encodeConfig(hvcc: Data) -> Data {
+    public static func encodeConfig(lane: UInt32, hvcc: Data) -> Data {
         var out = Data([0x01])
+        out.append(contentsOf: bigEndianBytes(UInt64(lane)).suffix(4))
         out.append(hvcc)
         return out
     }
 
-    public static func encodeFrame(seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data)
-        -> Data
-    {
+    public static func encodeFrame(
+        lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data
+    ) -> Data {
         var out = Data([0x02])
+        out.append(contentsOf: bigEndianBytes(UInt64(lane)).suffix(4))
         out.append(contentsOf: bigEndianBytes(seq))
         out.append(contentsOf: bigEndianBytes(ptsMicros))
         out.append(keyframe ? 1 : 0)
@@ -317,16 +342,18 @@ public enum VideoWire {
 
     public static func decode(_ payload: Data) -> Message? {
         let bytes = [UInt8](payload)
-        guard let type = bytes.first else { return nil }
-        switch type {
+        guard bytes.count >= 5 else { return nil }
+        let lane = bytes[1...4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        switch bytes[0] {
         case 0x01:
-            return .config(hvcc: Data(bytes.dropFirst()))
+            return .config(lane: lane, hvcc: Data(bytes[5...]))
         case 0x02:
-            guard bytes.count >= 18 else { return nil }
-            let seq = beUInt64(bytes, 1)
-            let pts = beUInt64(bytes, 9)
-            let keyframe = bytes[17] != 0
-            return .frame(seq: seq, ptsMicros: pts, keyframe: keyframe, data: Data(bytes[18...]))
+            guard bytes.count >= 22 else { return nil }
+            let seq = beUInt64(bytes, 5)
+            let pts = beUInt64(bytes, 13)
+            let keyframe = bytes[21] != 0
+            return .frame(
+                lane: lane, seq: seq, ptsMicros: pts, keyframe: keyframe, data: Data(bytes[22...]))
         default:
             return nil
         }

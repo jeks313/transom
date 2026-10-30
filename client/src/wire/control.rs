@@ -69,6 +69,14 @@ impl ResizePhase {
     }
 }
 
+/// One lane of the session: an app (or group) on its own virtual display, with
+/// its own video stream (protocol.md §1, v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lane {
+    pub lane: u32,
+    pub vds: Size,
+}
+
 /// One window's id + rect, as carried in a `tileLayout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileWindow {
@@ -79,14 +87,17 @@ pub struct TileWindow {
 /// Host → client. The full set the host can push (`ControlMessage` in Swift).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
-    /// First message on a fresh connection: protocol version + the whole virtual
-    /// display size, so we can sanity-check every rect we receive.
+    /// First message on a fresh connection: protocol version + every lane and
+    /// its virtual display size, so we can sanity-check every rect we receive.
     Hello {
         protocol: u32,
-        vds: Size,
+        lanes: Vec<Lane>,
     },
+    /// `rect` is in the VDS of `lane`. Ids are unique across lanes, so later
+    /// messages carry only the id.
     WindowCreated {
         id: u64,
+        lane: u32,
         rect: Rect,
         title: String,
         kind: WindowKind,
@@ -107,6 +118,7 @@ pub enum ServerMessage {
         id: u64,
     },
     TileLayout {
+        lane: u32,
         windows: Vec<TileWindow>,
         display: Size,
     },
@@ -131,9 +143,12 @@ pub enum ClientMessage {
     RequestClose {
         id: u64,
     },
-    /// Ask the host to emit a fresh intra frame after the decoder dropped stale
-    /// compressed frames to stay within the latency budget.
-    RequestKeyframe,
+    /// Ask the host to emit a fresh intra frame on `lane` (every lane when None)
+    /// after a decoder dropped stale compressed frames to stay within the latency
+    /// budget.
+    RequestKeyframe {
+        lane: Option<u32>,
+    },
     Input {
         id: u64,
         event: InputEvent,
@@ -221,12 +236,31 @@ impl ServerMessage {
             .as_str()
             .ok_or_else(|| DecodeError::Shape("`type` is not a string".to_string()))?;
         match ty {
-            "hello" => Ok(ServerMessage::Hello {
-                protocol: u32_field(&v, "protocol")?,
-                vds: size_field(&v, "vdsSize")?,
-            }),
+            "hello" => {
+                let protocol = u32_field(&v, "protocol")?;
+                // A v1 host has no lanes; report its version so the handshake
+                // can say which side to update.
+                if protocol != super::PROTOCOL_VERSION {
+                    return Ok(ServerMessage::Hello {
+                        protocol,
+                        lanes: Vec::new(),
+                    });
+                }
+                let arr = field(&v, "lanes")?
+                    .as_array()
+                    .ok_or_else(|| DecodeError::Shape("`lanes` is not an array".to_string()))?;
+                let mut lanes = Vec::with_capacity(arr.len());
+                for l in arr {
+                    lanes.push(Lane {
+                        lane: u32_field(l, "lane")?,
+                        vds: size_field(l, "vdsSize")?,
+                    });
+                }
+                Ok(ServerMessage::Hello { protocol, lanes })
+            }
             "windowCreated" => Ok(ServerMessage::WindowCreated {
                 id: u64_field(&v, "id")?,
+                lane: u32_field(&v, "lane")?,
                 rect: rect_field(&v, "rect")?,
                 title: str_field(&v, "title")?,
                 kind: WindowKind::from_wire(field(&v, "kind")?.as_str().unwrap_or("normal")),
@@ -257,6 +291,7 @@ impl ServerMessage {
                     });
                 }
                 Ok(ServerMessage::TileLayout {
+                    lane: u32_field(&v, "lane")?,
                     windows,
                     display: size_field(&v, "displaySize")?,
                 })
@@ -296,8 +331,12 @@ impl ClientMessage {
                 ("type", Value::str("requestClose")),
                 ("id", Value::uint(*id)),
             ]),
-            ClientMessage::RequestKeyframe => {
-                Value::object(vec![("type", Value::str("requestKeyframe"))])
+            ClientMessage::RequestKeyframe { lane } => {
+                let mut fields = vec![("type", Value::str("requestKeyframe"))];
+                if let Some(lane) = lane {
+                    fields.push(("lane", Value::uint(*lane as u64)));
+                }
+                Value::object(fields)
             }
             ClientMessage::Input { id, event, ts } => Value::object(vec![
                 ("type", Value::str("input")),
@@ -322,6 +361,30 @@ mod tests {
     #[test]
     fn decodes_hello() {
         let msg = ServerMessage::decode(
+            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ServerMessage::Hello {
+                protocol: 2,
+                lanes: vec![
+                    Lane {
+                        lane: 0,
+                        vds: Size { w: 5120, h: 2880 }
+                    },
+                    Lane {
+                        lane: 1,
+                        vds: Size { w: 4096, h: 2160 }
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_v1_hello_as_its_version_only() {
+        let msg = ServerMessage::decode(
             br#"{"type":"hello","protocol":1,"vdsSize":{"w":5120,"h":2880}}"#,
         )
         .unwrap();
@@ -329,7 +392,7 @@ mod tests {
             msg,
             ServerMessage::Hello {
                 protocol: 1,
-                vds: Size { w: 5120, h: 2880 }
+                lanes: Vec::new()
             }
         );
     }
@@ -358,15 +421,20 @@ mod tests {
     #[test]
     fn decodes_window_created_with_kind_and_unicode_title() {
         let msg = ServerMessage::decode(
-            r#"{"type":"windowCreated","id":42,"rect":{"x":0,"y":0,"w":800,"h":600},"title":"café — Xcode","kind":"normal"}"#
+            r#"{"type":"windowCreated","id":42,"lane":3,"rect":{"x":0,"y":0,"w":800,"h":600},"title":"café — Xcode","kind":"normal"}"#
                 .as_bytes(),
         )
         .unwrap();
         match msg {
             ServerMessage::WindowCreated {
-                id, title, kind, ..
+                id,
+                lane,
+                title,
+                kind,
+                ..
             } => {
                 assert_eq!(id, 42);
+                assert_eq!(lane, 3);
                 assert_eq!(title, "café — Xcode");
                 assert_eq!(kind, WindowKind::Normal);
             }
@@ -377,7 +445,7 @@ mod tests {
     #[test]
     fn unknown_kind_falls_back_to_normal() {
         let msg = ServerMessage::decode(
-            br#"{"type":"windowCreated","id":1,"rect":{"x":0,"y":0,"w":1,"h":1},"title":"","kind":"future"}"#,
+            br#"{"type":"windowCreated","id":1,"lane":0,"rect":{"x":0,"y":0,"w":1,"h":1},"title":"","kind":"future"}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -392,11 +460,16 @@ mod tests {
     #[test]
     fn decodes_tile_layout() {
         let msg = ServerMessage::decode(
-            br#"{"type":"tileLayout","windows":[{"id":1,"rect":{"x":0,"y":0,"w":100,"h":100}},{"id":2,"rect":{"x":110,"y":0,"w":100,"h":100}}],"displaySize":{"w":5120,"h":2880}}"#,
+            br#"{"type":"tileLayout","lane":1,"windows":[{"id":1,"rect":{"x":0,"y":0,"w":100,"h":100}},{"id":2,"rect":{"x":110,"y":0,"w":100,"h":100}}],"displaySize":{"w":5120,"h":2880}}"#,
         )
         .unwrap();
         match msg {
-            ServerMessage::TileLayout { windows, display } => {
+            ServerMessage::TileLayout {
+                lane,
+                windows,
+                display,
+            } => {
+                assert_eq!(lane, 1);
                 assert_eq!(windows.len(), 2);
                 assert_eq!(windows[1].id, 2);
                 assert_eq!(windows[1].rect.x, 110);
@@ -464,8 +537,16 @@ mod tests {
             r#"{"type":"requestClose","id":9}"#
         );
         assert_eq!(
-            ClientMessage::RequestKeyframe.to_value().to_json(),
+            ClientMessage::RequestKeyframe { lane: None }
+                .to_value()
+                .to_json(),
             r#"{"type":"requestKeyframe"}"#
+        );
+        assert_eq!(
+            ClientMessage::RequestKeyframe { lane: Some(2) }
+                .to_value()
+                .to_json(),
+            r#"{"type":"requestKeyframe","lane":2}"#
         );
     }
 }

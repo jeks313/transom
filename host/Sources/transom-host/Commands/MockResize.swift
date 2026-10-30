@@ -50,14 +50,18 @@ struct MockResize: AsyncParsableCommand {
         // Read the resync (hello + windowCreated* + tileLayout) to pick a window.
         var windows: [(id: UInt64, rect: WireRect)] = []
         var vds: WireSize?
+        var remainingLayouts = 1
         resync: while let frame = try await transport.receiveFrame() {
             switch try WireCodec.decodeControl(frame) {
-            case let .hello(_, vdsSize):
-                vds = vdsSize
-            case let .windowCreated(id, rect, _, _):
+            case let .hello(_, lanes):
+                // Lane 0's display; the clamp check below assumes one lane.
+                vds = lanes.first?.vdsSize
+                remainingLayouts = lanes.count
+            case let .windowCreated(id, lane, rect, _, _) where lane == 0:
                 windows.append((id, rect))
             case .tileLayout:
-                break resync
+                remainingLayouts -= 1
+                if remainingLayouts <= 0 { break resync }
             default:
                 continue
             }

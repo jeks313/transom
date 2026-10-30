@@ -2,8 +2,8 @@
 //! window manager."
 //!
 //! It consumes the control stream (`ServerMessage`) and maintains the set of live
-//! windows, each with its **source rect** — the sub-rectangle of the shared VDS
-//! texture that this window occupies (protocol.md §2). The platform layer
+//! windows, each with its lane and its **source rect** — the sub-rectangle of
+//! that lane's VDS texture that this window occupies (protocol.md §2). The platform layer
 //! (Windows: `win::app`) turns the emitted `ModelEvent`s into real native
 //! windows, swapchain resizes, and crop rectangles, but owns none of this
 //! bookkeeping. Keeping it here means it compiles and is unit-tested on any host.
@@ -13,14 +13,16 @@
 //!  * The host reports **actual** geometry (I-4); the model just stores what it is
 //!    told and never assumes a requested size took effect.
 
-use crate::wire::{Rect, ServerMessage, Size, WindowKind};
+use crate::wire::{Lane, Rect, ServerMessage, Size, WindowKind};
 
-/// One managed window. `source` is its crop in the shared texture; its `w`/`h`
+/// One managed window. `source` is its crop in its lane's texture; its `w`/`h`
 /// are also exactly the pixel size the native proxy window's client area must be,
 /// because we blit 1:1 (invariants I-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
     pub id: u64,
+    /// The display (and video stream) the window is on.
+    pub lane: u32,
     pub source: Rect,
     pub title: String,
     pub kind: WindowKind,
@@ -34,7 +36,7 @@ pub enum ModelEvent {
     /// the platform layer should expect a fresh set of `WindowAdded`s and tear
     /// down any proxy window whose id does not reappear (see `Resynced`).
     Connected {
-        vds: Size,
+        lanes: Vec<Lane>,
     },
     /// A new window: create a proxy sized to `source.w × source.h`.
     WindowAdded(Window),
@@ -74,7 +76,7 @@ pub enum ModelEvent {
 /// stacking / Alt-Tab order is stable and debuggable.
 #[derive(Debug, Default)]
 pub struct WindowModel {
-    vds: Option<Size>,
+    lanes: Vec<Lane>,
     windows: Vec<Window>,
     focused: Option<u64>,
 }
@@ -88,8 +90,8 @@ impl WindowModel {
     // build the consumer keeps its own view from `ModelEvent`s, so these read as
     // unused there.
     #[allow(dead_code)]
-    pub fn vds(&self) -> Option<Size> {
-        self.vds
+    pub fn vds(&self, lane: u32) -> Option<Size> {
+        self.lanes.iter().find(|l| l.lane == lane).map(|l| l.vds)
     }
 
     #[allow(dead_code)]
@@ -116,18 +118,20 @@ impl WindowModel {
     /// removes a batch of stale windows).
     pub fn apply(&mut self, msg: ServerMessage) -> Vec<ModelEvent> {
         match msg {
-            ServerMessage::Hello { vds, .. } => {
-                self.vds = Some(vds);
-                vec![ModelEvent::Connected { vds }]
+            ServerMessage::Hello { lanes, .. } => {
+                self.lanes = lanes.clone();
+                vec![ModelEvent::Connected { lanes }]
             }
             ServerMessage::WindowCreated {
                 id,
+                lane,
                 rect,
                 title,
                 kind,
             } => {
                 let window = Window {
                     id,
+                    lane,
                     source: rect,
                     title: title.clone(),
                     kind,
@@ -193,8 +197,15 @@ impl WindowModel {
                     Vec::new()
                 }
             }
-            ServerMessage::TileLayout { windows, display } => {
-                self.vds = Some(display);
+            ServerMessage::TileLayout {
+                lane,
+                windows,
+                display,
+            } => {
+                match self.lanes.iter_mut().find(|l| l.lane == lane) {
+                    Some(l) => l.vds = display,
+                    None => self.lanes.push(Lane { lane, vds: display }),
+                }
                 let mut events = Vec::new();
                 // Update or add each window in the layout.
                 for tw in &windows {
@@ -215,6 +226,7 @@ impl WindowModel {
                         // `windowCreated`/`windowTitle` fills it in.
                         let window = Window {
                             id: tw.id,
+                            lane,
                             source: tw.rect,
                             title: String::new(),
                             kind: WindowKind::Normal,
@@ -223,12 +235,13 @@ impl WindowModel {
                         events.push(ModelEvent::WindowAdded(window));
                     }
                 }
-                // Drop any window not present in the layout (it died while we were
-                // away, or the host reorganized). Prune and report.
+                // Drop any window of this lane not present in the layout (it died
+                // while we were away, or the host reorganized). Prune and report.
+                // Other lanes' windows are in their own layouts.
                 let live: Vec<u64> = windows.iter().map(|w| w.id).collect();
                 let mut removed = Vec::new();
                 self.windows.retain(|w| {
-                    if live.contains(&w.id) {
+                    if w.lane != lane || live.contains(&w.id) {
                         true
                     } else {
                         removed.push(w.id);
@@ -236,7 +249,7 @@ impl WindowModel {
                     }
                 });
                 if let Some(f) = self.focused {
-                    if !live.contains(&f) {
+                    if removed.contains(&f) {
                         self.focused = None;
                     }
                 }
@@ -264,6 +277,7 @@ mod tests {
     fn created(id: u64, r: Rect, title: &str) -> ServerMessage {
         ServerMessage::WindowCreated {
             id,
+            lane: 0,
             rect: r,
             title: title.to_string(),
             kind: WindowKind::Normal,
@@ -273,17 +287,24 @@ mod tests {
     #[test]
     fn hello_sets_vds_and_connects() {
         let mut m = WindowModel::new();
+        let lanes = vec![
+            Lane {
+                lane: 0,
+                vds: Size { w: 5120, h: 2880 },
+            },
+            Lane {
+                lane: 1,
+                vds: Size { w: 4096, h: 2160 },
+            },
+        ];
         let ev = m.apply(ServerMessage::Hello {
-            protocol: 1,
-            vds: Size { w: 5120, h: 2880 },
+            protocol: 2,
+            lanes: lanes.clone(),
         });
-        assert_eq!(
-            ev,
-            vec![ModelEvent::Connected {
-                vds: Size { w: 5120, h: 2880 }
-            }]
-        );
-        assert_eq!(m.vds(), Some(Size { w: 5120, h: 2880 }));
+        assert_eq!(ev, vec![ModelEvent::Connected { lanes }]);
+        assert_eq!(m.vds(0), Some(Size { w: 5120, h: 2880 }));
+        assert_eq!(m.vds(1), Some(Size { w: 4096, h: 2160 }));
+        assert_eq!(m.vds(2), None);
     }
 
     #[test]
@@ -385,6 +406,7 @@ mod tests {
 
         // A resync layout that no longer contains window 2.
         let ev = m.apply(ServerMessage::TileLayout {
+            lane: 0,
             windows: vec![
                 TileWindow {
                     id: 1,
@@ -413,6 +435,7 @@ mod tests {
     fn tile_layout_adds_unseen_windows() {
         let mut m = WindowModel::new();
         let ev = m.apply(ServerMessage::TileLayout {
+            lane: 0,
             windows: vec![TileWindow {
                 id: 5,
                 rect: rect(0, 0, 30, 30),
@@ -423,5 +446,31 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ModelEvent::WindowAdded(w) if w.id == 5)));
         assert_eq!(m.get(5).unwrap().source, rect(0, 0, 30, 30));
+    }
+
+    #[test]
+    fn tile_layout_prunes_only_its_own_lane() {
+        let mut m = WindowModel::new();
+        m.apply(created(1, rect(0, 0, 10, 10), "lane 0"));
+        m.apply(ServerMessage::WindowCreated {
+            id: 2,
+            lane: 1,
+            rect: rect(0, 0, 10, 10),
+            title: "lane 1".to_string(),
+            kind: WindowKind::Normal,
+        });
+        // Lane 1's layout knows nothing of window 1, which must survive.
+        let ev = m.apply(ServerMessage::TileLayout {
+            lane: 1,
+            windows: vec![TileWindow {
+                id: 2,
+                rect: rect(0, 0, 10, 10),
+            }],
+            display: Size { w: 50, h: 50 },
+        });
+        assert!(ev.is_empty());
+        assert_eq!(m.windows().len(), 2);
+        assert_eq!(m.get(2).unwrap().lane, 1);
+        assert_eq!(m.vds(1), Some(Size { w: 50, h: 50 }));
     }
 }
