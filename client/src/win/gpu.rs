@@ -103,7 +103,7 @@ float4 ps_main(VSOut i) : SV_Target {
     float b = clamp((298.0 * y + 541.0 * u + 128.0) / (256.0 * 255.0), 0.0, 1.0);
     float g = clamp((298.0 * y - 55.0 * u - 136.0 * v + 128.0) / (256.0 * 255.0), 0.0, 1.0);
     float r = clamp((298.0 * y + 459.0 * v + 128.0) / (256.0 * 255.0), 0.0, 1.0);
-    return float4(b, g, r, 1.0);
+    return float4(r, g, b, 1.0);
 }
 "#;
 
