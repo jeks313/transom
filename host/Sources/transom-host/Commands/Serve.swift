@@ -50,6 +50,13 @@ struct Serve: AsyncParsableCommand {
         help: "Private address to bind (default localhost). Use the LAN IP for a real client.")
     var host: String = "127.0.0.1"
 
+    @Flag(
+        inversion: .prefixedNo,
+        help:
+            "Move system prompts (Touch ID, password, admin approval) that would block a shared app off the Mac's screen onto a display of their own, shared like a window."
+    )
+    var prompts: Bool = true
+
     @Option(name: .long, help: "Control channel TCP port.")
     var controlPort: UInt16 = TransomPorts.control
 
@@ -164,6 +171,14 @@ struct Serve: AsyncParsableCommand {
             moreLanes.append(
                 LaneConfig(targets: spec.apps, display: try await ownDisplay(for: spec.apps[0], size: spec.size)))
         }
+        var promptDisplay: DisplayInfo?
+        if prompts {
+            let made = try await OwnedDisplay.create(
+                name: "Transom prompts", widthPoints: 1280, heightPoints: 800,
+                serial: Self.stableSerial("one.transom.prompts"))
+            owned.append(made)
+            promptDisplay = made.info
+        }
         defer { withExtendedLifetime(owned) {} }
         guard let videoFormat = HEVCEncoder.Format(cliToken: chroma) else {
             throw ProbeError("unknown --chroma \"\(chroma)\"; expected 420 or 444.")
@@ -181,7 +196,7 @@ struct Serve: AsyncParsableCommand {
             videoPort: videoPort, gutter: gutter, tile: tile, video: video,
             bitrateMbps: bitrate, fps: fps, videoFormat: videoFormat,
             namesakeModifiers: namesakeModifiers, logInput: logInput, inputDelivery: delivery,
-            restoreWindows: restoreWindows
+            restoreWindows: restoreWindows, promptDisplay: promptDisplay
         )
         let session = HostSession(config: config)
 
@@ -189,6 +204,9 @@ struct Serve: AsyncParsableCommand {
             print(
                 "serve: lane \(index): \(lane.targets.map(\.name).joined(separator: ", ")) on display \(lane.display.id) (\(lane.display.pixelWidth)x\(lane.display.pixelHeight) px)"
             )
+        }
+        if let promptDisplay {
+            print("serve: lane \(config.lanes.count): system prompts on display \(promptDisplay.id)")
         }
         print(
             "  control: \(host):\(controlPort)   video: \(video ? "\(host):\(videoPort)" : "off")")

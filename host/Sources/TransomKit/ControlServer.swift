@@ -19,10 +19,13 @@ public actor ControlServer {
         public let id: UInt32
         public let vdsSize: WireSize
         public let registry: WindowRegistry
-        public init(id: UInt32, vdsSize: WireSize, registry: WindowRegistry) {
+        /// What every window of the lane is: `.sheet` for the prompt lane.
+        public let kind: WindowKind
+        public init(id: UInt32, vdsSize: WireSize, registry: WindowRegistry, kind: WindowKind = .normal) {
             self.id = id
             self.vdsSize = vdsSize
             self.registry = registry
+            self.kind = kind
         }
     }
 
@@ -87,8 +90,9 @@ public actor ControlServer {
             app = Self.app(of: id, in: registry)
         }
         do {
+            let kind = lanes.first { $0.id == lane }?.kind ?? .normal
             try await active.transport.send(
-                try WireCodec.encode(Self.message(for: event, lane: lane, app: app)))
+                try WireCodec.encode(Self.message(for: event, lane: lane, app: app, kind: kind)))
         } catch {
             Log.general.notice(
                 "control: send failed, dropping client: \(error.localizedDescription, privacy: .public)"
@@ -194,7 +198,7 @@ public actor ControlServer {
                     try WireCodec.encode(
                         .windowCreated(
                             id: entry.id, lane: lane.id, app: Self.app(of: entry.id, in: lane.registry),
-                            rect: entry.rect, title: entry.title, kind: .normal)))
+                            rect: entry.rect, title: entry.title, kind: lane.kind)))
             }
             let windows = entries.map { WireWindow(id: $0.id, rect: $0.rect) }
             try await transport.send(
@@ -206,15 +210,16 @@ public actor ControlServer {
         }
     }
 
-    private static func message(for event: WindowWatcher.WindowEvent, lane: UInt32, app: UInt32)
-        -> ControlMessage
+    private static func message(
+        for event: WindowWatcher.WindowEvent, lane: UInt32, app: UInt32, kind: WindowKind
+    ) -> ControlMessage
     {
         switch event {
         case .sharingFailed(let message):
             return .error(code: 2, message: message)
         case .created(let id, let rect, let title):
             return .windowCreated(
-                id: id, lane: lane, app: app, rect: rect, title: title, kind: .normal)
+                id: id, lane: lane, app: app, rect: rect, title: title, kind: kind)
         case .moved(let id, let rect):
             return .windowMoved(id: id, rect: rect)
         case .destroyed(let id):

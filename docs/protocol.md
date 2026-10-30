@@ -40,6 +40,15 @@ One process holding every lane also avoids a macOS 26 failure: a capture started
 while another host process is capturing can hang in `startCapture`. The host bounds
 each start and retries it on a fresh stream.
 
+**The prompt lane.** `serve` also creates a lane for system prompts (Touch ID,
+password and admin-approval dialogs, Gatekeeper and notification alerts) unless
+started with `--no-prompts`. Such a prompt appears on the Mac's own screen, where
+the client cannot see it, and leaves the app behind it looking frozen. Every half
+second the host moves any prompt window outside the session's displays onto the
+prompt lane's display and shares its process there. Its windows have `kind:
+"sheet"`, and the client opens a sheet at once instead of listing it. Input
+reaches it like any window. The lane captures nothing until the first prompt.
+
 `serve` takes extra lanes with `--lane APP[,APP...][=WIDTHxHEIGHT]` (size in points,
 default `--display-size`); each gets a display of its own.
 

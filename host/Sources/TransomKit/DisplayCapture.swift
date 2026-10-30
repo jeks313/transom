@@ -29,7 +29,12 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
 
     private let display: DisplayInfo
     private let fps: Int
-    private let applicationPIDs: Set<pid_t>?
+    /// The apps captured, or nil for the whole display. Grows with `include`.
+    private var applicationPIDs: Set<pid_t>? {
+        get { lock.withLock { _applicationPIDs } }
+        set { lock.withLock { _applicationPIDs = newValue } }
+    }
+    private var _applicationPIDs: Set<pid_t>?
     private let showsCursor: Bool
     private let pixelFormat: OSType
     private let queue = DispatchQueue(label: "one.transom.host.capture")
@@ -64,7 +69,7 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     ) {
         self.display = display
         self.fps = fps
-        self.applicationPIDs = applicationPIDs
+        self._applicationPIDs = applicationPIDs
         self.pixelFormat = pixelFormat
         self.showsCursor = showsCursor
         super.init()
@@ -127,25 +132,39 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
         }
     }
 
-    private func startOnce(attempt: Int) async throws {
+    /// Whether a stream is running.
+    public var isRunning: Bool { lock.withLock { stream != nil } }
+
+    /// Capture `pid`'s windows too. A running stream takes the wider filter in
+    /// place; a stopped one uses it when it starts.
+    public func include(pid: pid_t) async throws {
+        guard var pids = applicationPIDs, !pids.contains(pid) else { return }
+        pids.insert(pid)
+        applicationPIDs = pids
+        guard let stream = lock.withLock({ self.stream }) else { return }
+        try await stream.updateContentFilter(try await makeFilter())
+    }
+
+    private func makeFilter() async throws -> SCContentFilter {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: false)
         guard let scDisplay = content.displays.first(where: { $0.displayID == display.id })
         else {
             throw CaptureError.displayNotFound(display.id)
         }
-
-        let filter: SCContentFilter
         if let applicationPIDs {
             // Inclusion, not exclusion: other apps, the desktop and this host's
             // own panel must never appear inside a selected window's crop.
             let applications = content.applications.filter { applicationPIDs.contains($0.processID) }
             guard !applications.isEmpty else { throw CaptureError.noSelectedApplications }
-            filter = SCContentFilter(display: scDisplay, including: applications, exceptingWindows: [])
-        } else {
-            // Whole-display capture is reserved for the diagnostic CLI/probe.
-            filter = SCContentFilter(display: scDisplay, excludingWindows: [])
+            return SCContentFilter(display: scDisplay, including: applications, exceptingWindows: [])
         }
+        // Whole-display capture is reserved for the diagnostic CLI/probe.
+        return SCContentFilter(display: scDisplay, excludingWindows: [])
+    }
+
+    private func startOnce(attempt: Int) async throws {
+        let filter = try await makeFilter()
 
         let config = SCStreamConfiguration()
         // The load-bearing lines for I-1: exact native pixels, no scaling.

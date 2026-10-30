@@ -45,7 +45,7 @@ use super::menu::MenuBar;
 use super::proxy::Proxy;
 use crate::model::{ModelEvent, Window};
 use crate::session::{Session, SessionEvent, VideoEvent};
-use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size};
+use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size, WindowKind};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, IsIconic, IsWindowVisible, KillTimer, SetForegroundWindow, SetTimer, SW_HIDE,
@@ -247,23 +247,7 @@ impl App {
                 self.disconnect_to_dashboard();
             }
             Some(Action::OpenWindow(id)) => {
-                if let Some(proxy) = self.proxies.get(&id) {
-                    unsafe {
-                        let _ = ShowWindow(
-                            proxy.hwnd,
-                            if IsIconic(proxy.hwnd).as_bool() {
-                                SW_RESTORE
-                            } else {
-                                SW_SHOW
-                            },
-                        );
-                        let _ = SetForegroundWindow(proxy.hwnd);
-                    }
-                } else if let Some(w) = self.windows.get(&id).cloned() {
-                    if let Err(e) = self.create_proxy(id, w.source, &w.title, app_ptr) {
-                        self.notice = Some(format!("Could not open window: {e}"));
-                    }
-                }
+                self.open_window(id, app_ptr);
                 self.refresh_gallery();
                 self.update_status();
             }
@@ -437,7 +421,7 @@ impl App {
         }
     }
 
-    fn apply_model_event(&mut self, ev: ModelEvent, _app_ptr: *mut App) {
+    fn apply_model_event(&mut self, ev: ModelEvent, app_ptr: *mut App) {
         match ev {
             ModelEvent::Connected { lanes } => {
                 self.lanes.clear();
@@ -457,7 +441,15 @@ impl App {
                 }
             }
             ModelEvent::WindowAdded(w) => {
-                self.windows.insert(w.id, w);
+                // A sheet (a system prompt the host moved onto its prompt
+                // display) is blocking something: show it at once instead of
+                // waiting in the gallery.
+                let open = w.kind != WindowKind::Normal;
+                let id = w.id;
+                self.windows.insert(id, w);
+                if open {
+                    self.open_window(id, app_ptr);
+                }
             }
             ModelEvent::WindowRectChanged { id, source, .. } => {
                 if let Some(w) = self.windows.get_mut(&id) {
@@ -501,6 +493,31 @@ impl App {
         }
         self.refresh_gallery();
         self.update_status();
+    }
+
+    /// Show window `id`'s proxy, creating it the first time, and bring it forward.
+    fn open_window(&mut self, id: u64, app_ptr: *mut App) {
+        if let Some(proxy) = self.proxies.get(&id) {
+            unsafe {
+                let _ = ShowWindow(
+                    proxy.hwnd,
+                    if IsIconic(proxy.hwnd).as_bool() {
+                        SW_RESTORE
+                    } else {
+                        SW_SHOW
+                    },
+                );
+                let _ = SetForegroundWindow(proxy.hwnd);
+            }
+        } else if let Some(w) = self.windows.get(&id).cloned() {
+            if let Err(e) = self.create_proxy(id, w.source, &w.title, app_ptr) {
+                self.notice = Some(format!("Could not open window: {e}"));
+            } else if let Some(proxy) = self.proxies.get(&id) {
+                unsafe {
+                    let _ = SetForegroundWindow(proxy.hwnd);
+                }
+            }
+        }
     }
 
     fn refresh_gallery(&mut self) {

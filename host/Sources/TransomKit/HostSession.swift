@@ -49,6 +49,10 @@ public struct HostConfig: Sendable {
     /// display before tiling, so every window of a selected app is shared
     /// (`WindowRestorer`). Off shares only what is already on the display.
     public var restoreWindows: Bool
+    /// A display for system prompts (Touch ID, password, admin approval) that
+    /// would otherwise block a shared app from the Mac's own screen. Nil leaves
+    /// them where they are. See `PromptPolicy`.
+    public var promptDisplay: DisplayInfo?
 
     /// - Parameters:
     ///   - target, additionalTargets, display: lane 0.
@@ -71,7 +75,8 @@ public struct HostConfig: Sendable {
         namesakeModifiers: Bool = false,
         logInput: Bool = false,
         inputDelivery: InputDelivery = .background,
-        restoreWindows: Bool = true
+        restoreWindows: Bool = true,
+        promptDisplay: DisplayInfo? = nil
     ) {
         var seen: Set<pid_t> = []
         self.lanes = ([LaneConfig(targets: [target] + additionalTargets, display: display)] + moreLanes)
@@ -90,6 +95,7 @@ public struct HostConfig: Sendable {
         self.logInput = logInput
         self.inputDelivery = inputDelivery
         self.restoreWindows = restoreWindows
+        self.promptDisplay = promptDisplay
     }
 }
 
@@ -321,13 +327,22 @@ public final class HostSession: @unchecked Sendable {
                     id: UInt32(index), config: laneConfig, registry: WindowRegistry(ids: ids),
                     emit: { lane, event in eventSink.yield((lane, event)) }))
         }
+        if let promptDisplay = config.promptDisplay {
+            lanes.append(
+                makePromptLane(
+                    id: UInt32(lanes.count), display: promptDisplay, registry: WindowRegistry(ids: ids)))
+        }
         let lanes = self.lanes
 
         let (clientMessages, clientSink) = AsyncStream.makeStream(of: ClientMessage.self)
         self.clientSink = clientSink
 
         let controlServer = ControlServer(
-            lanes: lanes.map { .init(id: $0.id, vdsSize: $0.vdsSize, registry: $0.registry) })
+            lanes: lanes.map {
+                .init(
+                    id: $0.id, vdsSize: $0.vdsSize, registry: $0.registry,
+                    kind: $0.isPromptLane ? .sheet : .normal)
+            })
         self.controlServer = controlServer
         await controlServer.setOnClientMessage { message in clientSink.yield(message) }
         await controlServer.setOnConnectionChange { [weak self] connected in
@@ -373,9 +388,17 @@ public final class HostSession: @unchecked Sendable {
                         }
                     } : nil
                 if let layoutTimer { RunLoop.current.add(layoutTimer, forMode: .default) }
+                let promptTimer = lanes.first(where: \.isPromptLane).map { promptLane in
+                    Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                        self?.adoptPrompts(into: promptLane, lanes: lanes)
+                    }
+                }
+                if let promptTimer { RunLoop.current.add(promptTimer, forMode: .default) }
                 CFRunLoopRun()
                 layoutTimer?.invalidate()
-                for watcher in watchers { watcher.stop() }
+                promptTimer?.invalidate()
+                // Prompt watchers were added on this thread after the start.
+                for watcher in lanes.flatMap(\.watchers) { watcher.stop() }
             }
             watcherThread.stackSize = 1 << 20
             watcherThread.start()
@@ -576,6 +599,71 @@ public final class HostSession: @unchecked Sendable {
         }
     }
 
+    /// The lane for system prompts: no apps of its own until one is adopted.
+    private func makePromptLane(id: UInt32, display: DisplayInfo, registry: WindowRegistry) -> Lane {
+        let resize = ResizeService(
+            registry: registry, display: display, gutter: config.gutter,
+            emit: { [weak self] event in self?.eventSink?.yield((id, event)) })
+        let injector = InputInjector(
+            display: display, registry: registry,
+            modifierMap: config.namesakeModifiers ? .namesake : .swap,
+            delivery: config.inputDelivery)
+        if config.logInput { injector.onTrace = { line in print("  \(line)") } }
+        let lane = Lane(
+            id: id, targets: [], display: display, registry: registry, watchers: [],
+            resize: resize, injector: injector)
+        lane.isPromptLane = true
+        return lane
+    }
+
+    /// Move every prompt window outside the session's displays onto the prompt
+    /// lane's, and share its process there: watch its windows, capture them, and
+    /// start that capture with the first one. Runs on the watcher run-loop thread.
+    private func adoptPrompts(into lane: Lane, lanes: [Lane]) {
+        let shared = lanes.map { CGRect(origin: $0.display.originPoints, size: $0.display.sizePoints) }
+        let listing =
+            (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]]) ?? []
+        let display = CGRect(origin: lane.display.originPoints, size: lane.display.sizePoints)
+        for candidate in PromptPolicy.candidates(windows: listing, shared: shared)
+        where !lane.unmovablePrompts.contains(candidate.windowNumber) {
+            let origin = PromptPolicy.slot(
+                index: lane.promptsAdopted, size: candidate.bounds.size, display: display)
+            guard PromptPolicy.move(candidate, to: origin) else {
+                // Left where it is; noted once rather than every half second.
+                lane.unmovablePrompts.insert(candidate.windowNumber)
+                Log.ax.notice("prompt: could not move a \(candidate.owner, privacy: .public) window")
+                continue
+            }
+            lane.promptsAdopted += 1
+            Log.ax.notice(
+                "prompt: moved a \(candidate.owner, privacy: .public) window onto the prompt display")
+            guard lane.promptPIDs.insert(candidate.pid).inserted else { continue }
+            let watcher = WindowWatcher(
+                pid: candidate.pid, display: lane.display, registry: lane.registry,
+                appName: PromptPolicy.displayName(owner: candidate.owner))
+            let laneID = lane.id
+            watcher.onEvent = { [weak self] event in self?.eventSink?.yield((laneID, event)) }
+            do {
+                try watcher.start()
+                lane.watchers.append(watcher)
+            } catch {
+                Log.ax.notice("prompt: cannot watch \(candidate.owner, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+            guard let capture = lane.capture else { continue }
+            let pid = candidate.pid
+            let start = lane.claimCaptureStart()
+            Task {
+                do {
+                    try await capture.include(pid: pid)
+                    if start { try await capture.start() }
+                } catch {
+                    Log.encode.notice("prompt: capture failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+    }
+
     /// Re-tile a lane whose windows a Mac-side change left overlapping. Runs on
     /// the watcher run-loop thread.
     private func enforceLayout(_ lane: Lane, gutter: Int) {
@@ -657,7 +745,8 @@ public final class HostSession: @unchecked Sendable {
                 self?.markEncodeStart(lane: laneID)
                 try? enc.encode(pixelBuffer, pts: pts, duration: frameDuration)
             }
-            try await cap.start()
+            // The prompt lane has nothing to capture until a prompt is adopted.
+            if !lane.isPromptLane { try await cap.start() }
             tasks.append(Task { for await f in frames { await videoServer.send(f, lane: laneID) } })
         }
 
@@ -817,12 +906,24 @@ private final class Lane: @unchecked Sendable {
     let targets: [TargetApp]
     let display: DisplayInfo
     let registry: WindowRegistry
-    let watchers: [WindowWatcher]
+    var watchers: [WindowWatcher]
     let resize: ResizeService
     let injector: InputInjector
     var capture: DisplayCapture?
     var encoder: HEVCEncoder?
     var layoutGuard = LayoutGuard()
+    /// The prompt lane's state, touched only on the watcher run-loop thread.
+    var isPromptLane = false
+    var promptPIDs: Set<pid_t> = []
+    var promptsAdopted = 0
+    var unmovablePrompts: Set<Int> = []
+    private var captureClaimed = false
+
+    /// True once: whoever gets it starts the capture.
+    func claimCaptureStart() -> Bool {
+        defer { captureClaimed = true }
+        return !captureClaimed
+    }
 
     var vdsSize: WireSize {
         WireSize(w: UInt32(display.pixelWidth), h: UInt32(display.pixelHeight))

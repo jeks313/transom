@@ -33,6 +33,8 @@ struct Options {
     resize: Option<(u64, u32, u32)>,
     /// Window id, menu path and the item's title.
     menu_pick: Option<(u64, Vec<u32>, String)>,
+    /// The window --type types into; the first window when unset.
+    window: Option<u64>,
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -278,9 +280,12 @@ fn maybe_run_actions(
     if !*pending {
         return;
     }
-    let Some(&target) = order.first() else {
+    let Some(target) = opts.window.or_else(|| order.first().copied()) else {
         return; // no window yet
     };
+    if !order.contains(&target) {
+        return; // that window not announced yet
+    }
     *pending = false;
 
     // Raise the target first so input lands in the right place (protocol.md §4).
@@ -386,6 +391,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut click: Option<(u64, u32, u32)> = None;
     let mut resize: Option<(u64, u32, u32)> = None;
     let mut menu_pick: Option<(u64, Vec<u32>, String)> = None;
+    let mut window: Option<u64> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -421,6 +427,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--resize" => {
                 resize = Some(parse_triple(&take(args, &mut i, "--resize")?, "--resize")?);
             }
+            "--window" => {
+                let v = take(args, &mut i, "--window")?;
+                window = Some(v.parse().map_err(|_| format!("--window wants an id, got {v}"))?);
+            }
             "--menu-pick" => {
                 let v = take(args, &mut i, "--menu-pick")?;
                 let bad = || format!("--menu-pick wants id:path=title, like 4:4/0=Show Bar; got {v}");
@@ -451,6 +461,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         click,
         resize,
         menu_pick,
+        window,
     })
 }
 
@@ -493,6 +504,7 @@ pub fn print_usage() {
          --click <id:x:y>     left-click window <id> at window-local pixel (x,y)\n    \
          --resize <id:w:h>    request a begin/live/end resize of window <id> to w x h\n\
          --menu-pick <id:path=title>  choose a menu item of window <id>'s app\n\
+         --window <id>        the window --type types into (default: the first)\n\
          \n\
          EXAMPLE:\n    \
          transom-client connect 127.0.0.1 --control-port 47100 --seconds 5 --type hello"
