@@ -30,9 +30,10 @@ sockets.
 ### Lanes (v2)
 
 A session shares one or more **lanes**. A lane is an app (or a group of apps) on
-its own virtual display, with its own capture and encoder. Every lane travels over
-the same two connections: `hello` lists the lanes, `windowCreated` and
-`tileLayout` name the lane a window is on, and every video message names its lane.
+its own virtual display, with its own capture. Every lane travels over the same
+two connections: `hello` lists the lanes, and `windowCreated` and `tileLayout`
+name the lane a window is on. Video is per window (v4, §6): every video message
+names its window.
 Window ids are unique across lanes, so every other message carries only the id.
 Lane ids are small integers starting at 0; lane 0 always exists.
 
@@ -161,7 +162,7 @@ reconnecting client gets the full resync again.
 ### Host -> Client
 
 ```
-hello          { protocol: 3, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
+hello          { protocol: 4, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
 windowCreated  { id: u64, lane: u32, app: u32, rect: Rect, title: String, kind: WindowKind }
 windowDestroyed{ id: u64 }
 windowMoved    { id: u64, rect: Rect }                  // ACTUAL geometry, see I-4
@@ -200,7 +201,7 @@ is authoritative here; this line was corrected to match it — AGENTS.md.)
 requestResize  { id: u64, size: Size, phase: ResizePhase }
 requestFocus   { id: u64 }
 requestClose   { id: u64 }
-requestKeyframe{ lane?: u32 }                           // omitted lane = every lane
+requestKeyframe{ id?: u64 }                             // a window's stream; omitted = every window
 menuPick       { id: u64, path: [u32], title: String }  // choose a menu item
 menuRefresh    { id: u64 }                              // a menu is opening
 input          { id: u64, event: InputEvent, ts: u64 }
@@ -421,29 +422,41 @@ The video channel is **binary**, length-prefixed like the control channel (§1),
 but the payload is not JSON. The first payload byte is a type tag:
 
 ```
-0x01  config   : lane:u32  hvcC ...                          // HEVC parameter sets (VPS/SPS/PPS)
-0x02  frame    : lane:u32  seq:u64  ptsMicros:u64  flags:u8
+0x01  config   : stream:u64  width:u32  height:u32  hvcC ...   // HEVC parameter sets (VPS/SPS/PPS)
+0x02  frame    : stream:u64  seq:u64  ptsMicros:u64  flags:u8
                  capturedMicros:u64  encodedMicros:u64  sentMicros:u64  hevc...   // one access unit
                  flags bit0 = keyframe.  integers big-endian.
 ```
 
-**Stage stamps (v3).** `ptsMicros` is when the frame was composited;
+`stream` is the id of the window the stream shows (v4).
+
+**Stage stamps (v3).** `ptsMicros` is when the frame was due on screen (which can
+fall a few ms after the capture had it, so the client starts a frame's total at
+the earlier stamp);
 `capturedMicros`, `encodedMicros` and `sentMicros` are when the capture handed it
 to the encoder, the encoder returned it, and the host began writing it, all on the
 host clock (§4 clock sync). The client stamps arrival, decode and present on its
 own clock and reports each stage (`latency.log` in `%LOCALAPPDATA%\Transom`, and
 `connect --video` prints them).
 
-Each lane is an independent stream: its own config, keyframe gate and `seq`. The
-client keeps one decoder and one texture per lane.
+**Each window is its own stream (v4)**: its own encoder at its own size, config,
+keyframe gate and `seq`; the client keeps one decoder and one texture per window.
+The Mac has one hardware HEVC encoder whose time is set by pixel count (about
+1.45 ms a megapixel on an M5 Pro), so encoding a whole lane cost 23 ms at 5K even
+for a blinking caret. The host still captures each lane as one display (a
+window's menus and popovers stay in its picture) but crops out, with a Metal
+blit, only the windows ScreenCaptureKit reports dirty and encodes those. A window
+that changes size gets a new encoder, and a new `config` before its keyframe.
 
-- **A lane's `config` is sent first**, before its first keyframe, and again after
-  a reconnect. An `hvc1` stream carries no inline parameter sets, so the decoder
-  needs the `hvcC` configuration record before it can decode anything.
-  A video connection requests a fresh keyframe and a native-size capture
-  refresh, including when the display is idle. The server suppresses deltas
-  until that keyframe and its configuration are available. A second refresh
-  releases decoders that retain one frame of pipeline delay.
+- **A stream's `config` is sent first**, before its first keyframe, again after a
+  reconnect, and whenever the window's encoder is replaced. An `hvc1` stream
+  carries no inline parameter sets, so the decoder needs the `hvcC` configuration
+  record before it can decode anything. `width`/`height` are the stream's pixels;
+  a decoder may pad its pictures to a block size, and the padding is cropped off.
+  A video connection requests a keyframe of every window and a capture refresh,
+  including when the display is idle. The server suppresses a stream's deltas
+  until its keyframe and configuration are available. There are no periodic
+  keyframes (a 60 s backstop only): the client asks with `requestKeyframe`.
 - **`frame`** carries `seq` (monotonic), `ptsMicros` (host clock, microseconds),
   a keyframe flag, and HEVC access-unit bytes in **length-prefixed NAL format**
   (VideoToolbox `hvc1` sample data, not Annex B). The NAL length field width is
