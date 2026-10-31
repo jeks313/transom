@@ -83,8 +83,8 @@ struct Serve: AsyncParsableCommand {
     @Option(name: .long, help: "Video target bitrate in Mbps.")
     var bitrate: Int = 40
 
-    @Option(name: .long, help: "Video target frame rate.")
-    var fps: Int = 60
+    @Option(name: .long, help: "Video target frame rate; the session's own displays refresh at it.")
+    var fps: Int = 120
 
     @Option(
         name: .long,
@@ -146,6 +146,8 @@ struct Serve: AsyncParsableCommand {
         }
         // Held for the whole run: releasing one removes its display.
         var owned: [OwnedDisplay] = []
+        // A display refreshes no faster than this, and capture no faster than it.
+        let displayHz = max(60, fps)
         func ownDisplay(for app: TargetApp, size: String) async throws -> DisplayInfo {
             let parts = size.split(separator: "x").compactMap { Int($0) }
             guard parts.count == 2 else {
@@ -153,7 +155,10 @@ struct Serve: AsyncParsableCommand {
             }
             let made = try await OwnedDisplay.create(
                 name: "Transom \(app.name)", widthPoints: parts[0], heightPoints: parts[1],
-                serial: Self.stableSerial(app.bundleID ?? app.name))
+                serial: Self.stableSerial(app.bundleID ?? app.name), refreshHz: displayHz)
+            if made.refreshHz < displayHz {
+                print("  warning: \(app.name)'s display runs at \(made.refreshHz) Hz, not \(displayHz); capture is capped there.")
+            }
             owned.append(made)
             return made.info
         }
@@ -175,7 +180,7 @@ struct Serve: AsyncParsableCommand {
         if prompts {
             let made = try await OwnedDisplay.create(
                 name: "Transom prompts", widthPoints: 1280, heightPoints: 800,
-                serial: Self.stableSerial("one.transom.prompts"))
+                serial: Self.stableSerial("one.transom.prompts"), refreshHz: displayHz)
             owned.append(made)
             promptDisplay = made.info
         }

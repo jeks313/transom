@@ -1,6 +1,6 @@
 // transom-display: owns one virtual display for a `serve` session.
 //
-//   transom-display <name> <widthPt> <heightPt> [serial]
+//   transom-display <name> <widthPt> <heightPt> [serial] [refreshHz]
 //
 // Creates a HiDPI (2x) CGVirtualDisplay, places it to the right of every other display (never
 // main, so the Mac's own screen keeps the menu bar, the Dock and any permission prompt), keeps the
@@ -12,7 +12,7 @@
 // loop for its own CoreGraphics to see the display's modes (see VirtualDisplay.swift); `serve` is
 // an async command without one. Output, on stdout:
 //
-//   ready id=<displayID> origin=<x>,<y> pt=<w>x<h> px=<w>x<h>
+//   ready id=<displayID> origin=<x>,<y> pt=<w>x<h> px=<w>x<h> hz=<refresh>
 //   error <message>
 import AppKit
 import IOKit.pwr_mgt
@@ -26,10 +26,11 @@ func fail(_ message: String) -> Never {
 
 let args = CommandLine.arguments
 guard args.count >= 4, let widthPt = Int(args[2]), let heightPt = Int(args[3]) else {
-    fail("usage: transom-display <name> <widthPt> <heightPt> [serial]")
+    fail("usage: transom-display <name> <widthPt> <heightPt> [serial] [refreshHz]")
 }
 let name = args[1]
 let serial = args.count > 4 ? UInt32(args[4]) ?? 1 : 1
+let refreshHz = args.count > 5 ? Double(args[5]) ?? 60 : 60
 
 let problems = VirtualDisplay.checkPrivateAPI()
 guard problems.isEmpty else { fail("virtual display API unavailable: \(problems.joined(separator: "; "))") }
@@ -52,7 +53,7 @@ Task { @MainActor in
     let display: VirtualDisplay
     do {
         display = try VirtualDisplay(
-            name: name, widthPt: widthPt, heightPt: heightPt, scale: 2,
+            name: name, widthPt: widthPt, heightPt: heightPt, scale: 2, refreshHz: refreshHz,
             productID: 0x7472, serialNum: serial)
     } catch {
         fail("\(error)")
@@ -81,8 +82,9 @@ Task { @MainActor in
         IOPMAssertionLevel(kIOPMAssertionLevelOn), "Transom is sharing windows" as CFString, &awake)
 
     let b = display.bounds, px = display.pixelSize
+    let hz = CGDisplayCopyDisplayMode(display.displayID)?.refreshRate ?? 0
     print("ready id=\(display.displayID) origin=\(Int(b.minX)),\(Int(b.minY)) "
-        + "pt=\(Int(b.width))x\(Int(b.height)) px=\(px.width)x\(px.height)")
+        + "pt=\(Int(b.width))x\(Int(b.height)) px=\(px.width)x\(px.height) hz=\(Int(hz.rounded()))")
 
     Thread.detachNewThread {
         while FileHandle.standardInput.availableData.count > 0 {}

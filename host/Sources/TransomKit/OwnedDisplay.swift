@@ -16,11 +16,14 @@ import Foundation
 /// this process dies, and macOS moves its windows back to a real display.
 public final class OwnedDisplay: @unchecked Sendable {
     public let info: DisplayInfo
+    /// The refresh rate macOS gave the display, which can differ from the one asked for.
+    public let refreshHz: Int
     private let child: Process
     private let stdin: Pipe
 
-    private init(info: DisplayInfo, child: Process, stdin: Pipe) {
+    private init(info: DisplayInfo, refreshHz: Int, child: Process, stdin: Pipe) {
         self.info = info
+        self.refreshHz = refreshHz
         self.child = child
         self.stdin = stdin
     }
@@ -29,9 +32,11 @@ public final class OwnedDisplay: @unchecked Sendable {
 
     /// Create a `widthPoints` x `heightPoints` display at 2x and wait until
     /// CoreGraphics reports it at that size. `serial` keeps macOS's remembered
-    /// arrangement stable for the same app across sessions.
+    /// arrangement stable for the same app across sessions. A display refreshing
+    /// at `refreshHz` lets capture deliver that many frames a second, and halves
+    /// the wait for the next frame at 120 against 60.
     public static func create(
-        name: String, widthPoints: Int, heightPoints: Int, serial: UInt32
+        name: String, widthPoints: Int, heightPoints: Int, serial: UInt32, refreshHz: Int = 60
     ) async throws -> OwnedDisplay {
         let helper = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
             .deletingLastPathComponent().appendingPathComponent("transom-display")
@@ -40,7 +45,9 @@ public final class OwnedDisplay: @unchecked Sendable {
         }
         let child = Process()
         child.executableURL = helper
-        child.arguments = [name, String(widthPoints), String(heightPoints), String(serial)]
+        child.arguments = [
+            name, String(widthPoints), String(heightPoints), String(serial), String(refreshHz),
+        ]
         let stdin = Pipe()
         let stdout = Pipe()
         child.standardInput = stdin
@@ -59,7 +66,8 @@ public final class OwnedDisplay: @unchecked Sendable {
             child.terminate()
             throw ProbeError("transom-display failed: \(line ?? "exited without output")")
         }
-        return OwnedDisplay(info: info, child: child, stdin: stdin)
+        return OwnedDisplay(
+            info: info, refreshHz: Self.parseRefresh(line) ?? 60, child: child, stdin: stdin)
     }
 
     /// `ready id=<id> origin=<x>,<y> pt=<w>x<h> px=<w>x<h>` as a display.
@@ -84,6 +92,11 @@ public final class OwnedDisplay: @unchecked Sendable {
             id: id, originPoints: CGPoint(x: origin.0, y: origin.1),
             sizePoints: CGSize(width: pt.0, height: pt.1), pixelWidth: px.0, pixelHeight: px.1,
             scale: Double(px.0) / Double(pt.0), isMain: false)
+    }
+
+    /// The `hz=` field of a ready line, absent from an older `transom-display`.
+    static func parseRefresh(_ line: String) -> Int? {
+        line.split(separator: " ").first { $0.hasPrefix("hz=") }.flatMap { Int($0.dropFirst(3)) }
     }
 
     /// Release the display. Safe to call more than once.

@@ -17,4 +17,10 @@ struct OwnedDisplayTests {
         #expect(OwnedDisplay.parseReady("error no display") == nil)
         #expect(OwnedDisplay.parseReady("ready id=1 origin=0,0 pt=0x0 px=0x0") == nil)
     }
+
+    @Test("the ready line carries the refresh rate macOS gave the display")
+    func parsesRefresh() {
+        #expect(OwnedDisplay.parseRefresh("ready id=77 origin=3008,0 pt=2048x1080 px=4096x2160 hz=120") == 120)
+        #expect(OwnedDisplay.parseRefresh("ready id=77 origin=3008,0 pt=2048x1080 px=4096x2160") == nil)
+    }
 }
