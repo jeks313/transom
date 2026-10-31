@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW, IsZoomed,
     LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostQuitMessage, RegisterClassW,
@@ -45,8 +45,8 @@ type ConnectResult = Result<(Connection, Session, Receiver<SessionEvent>), Strin
 use super::input;
 use super::menu::MenuBar;
 use super::proxy::Proxy;
-use crate::model::{ModelEvent, Window};
 use crate::latency::{self, FrameStamps, InputProbe, LatencyStats, STAGES};
+use crate::model::{ModelEvent, Window};
 use crate::session::{Session, SessionEvent, VideoEvent, VideoSink};
 use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size, WindowKind};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
@@ -135,6 +135,9 @@ pub struct App {
 struct StreamVideo {
     size: Size,
     source: Option<SourceTexture>,
+    /// A restarted stream's texture at its new size. The old picture stays up
+    /// until the new stream's first frame decodes, instead of the placeholder.
+    next_source: Option<SourceTexture>,
     decoder: Option<DecoderWorker>,
     /// Video-health counters. If access units keep arriving but none ever decode
     /// (the tell-tale of the in-box HEVC decoder rejecting the host's 4:4:4 10-bit
@@ -157,11 +160,20 @@ fn latency_log(lines: &[String]) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let path = std::path::PathBuf::from(dir).join("Transom").join("latency.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false) {
+    let path = std::path::PathBuf::from(dir)
+        .join("Transom")
+        .join("latency.log");
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1 << 20)
+        .unwrap_or(false)
+    {
         let _ = std::fs::rename(&path, path.with_extension("log.old"));
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
         return;
     };
     let stamp = std::time::SystemTime::now()
@@ -633,14 +645,17 @@ impl App {
                 let entry = self.streams.entry(stream).or_insert_with(|| StreamVideo {
                     size,
                     source: None,
+                    next_source: None,
                     decoder: None,
                     video_decoded: 0,
                     warned_no_decode: false,
                     shown: None,
                 });
                 entry.size = size;
+                entry.next_source = None;
                 if entry.source.as_ref().map(|s| (s.width, s.height)) != Some((width, height)) {
                     match SourceTexture::new(&self.gpu, width, height) {
+                        Ok(t) if entry.source.is_some() => entry.next_source = Some(t),
                         Ok(t) => entry.source = Some(t),
                         Err(e) => eprintln!("window {stream} texture creation failed: {e}"),
                     }
@@ -679,7 +694,9 @@ impl App {
                         submitted: latency::now_micros(),
                         ..stamps
                     };
-                    decoder.input().submit(data, keyframe, pts_micros, stamps, content);
+                    decoder
+                        .input()
+                        .submit(data, keyframe, pts_micros, stamps, content);
                 }
             }
         }
@@ -746,6 +763,9 @@ impl App {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
+        if frame.is_some() && stream.next_source.is_some() {
+            stream.source = stream.next_source.take();
+        }
         if let (Some(frame), Some(source)) = (frame, stream.source.as_mut()) {
             match &frame.texture {
                 Some(texture) => source.copy_from(&self.gpu, &texture.0),
@@ -1345,8 +1365,13 @@ impl App {
     }
 
     fn send_input(&self, id: u64, event: InputEvent) {
-        if matches!(event, InputEvent::KeyDown { .. } | InputEvent::MouseDown { .. }) {
-            self.input_probe.borrow_mut().on_input(id, latency::now_micros());
+        if matches!(
+            event,
+            InputEvent::KeyDown { .. } | InputEvent::MouseDown { .. }
+        ) {
+            self.input_probe
+                .borrow_mut()
+                .on_input(id, latency::now_micros());
         }
         self.send(&ClientMessage::Input {
             id,
@@ -1532,7 +1557,11 @@ pub fn run_pump(mut app: Box<App>) {
             // Wake on new input, or after ~8ms to re-poll the session channel.
             // A decoded frame wakes the loop at once, so it is presented now.
             let wake = [HANDLE((*app_ptr).wake.0 as _)];
-            let handles = if wake[0].0.is_null() { None } else { Some(&wake[..]) };
+            let handles = if wake[0].0.is_null() {
+                None
+            } else {
+                Some(&wake[..])
+            };
             MsgWaitForMultipleObjectsEx(handles, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
