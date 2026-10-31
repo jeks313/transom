@@ -12,7 +12,9 @@
 //!
 //! One device is shared by all proxy windows; each window owns only its swapchain
 //! and render-target view. The decoded frame (the whole VDS) is one shared
-//! texture (`SourceTexture`); each window samples its sub-rect out of it.
+//! texture (`SourceTexture`); each window samples its sub-rect out of it. The
+//! device is multithread protected so a hardware decoder can share it and hand
+//! frames over GPU to GPU.
 
 use std::mem::size_of;
 
@@ -20,20 +22,23 @@ use windows::core::{s, Interface};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS};
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    ID3DBlob, D3D11_SRV_DIMENSION_TEXTURE2D, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
-    D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
+    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
+    ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_WRITE_DISCARD, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC,
+    D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
@@ -70,7 +75,8 @@ cbuffer Params : register(b0) {
     uint mode;
     uint pad;
 };
-Texture2D<float> srcTex : register(t0);
+Texture2D<float> lumaTex : register(t0);
+Texture2D<float2> chromaTex : register(t1);
 SamplerState pointSampler : register(s0);
 
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -96,10 +102,10 @@ float4 ps_main(VSOut i) : SV_Target {
     }
     float2 uv = uvRect.xy + i.uv * uvRect.zw;
     uint2 p = min(uint2(uv * sourceSize), sourceSize - 1u);
-    float y = srcTex.Load(int3(p, 0)).r * 255.0 - 16.0;
-    uint2 chroma = uint2(p.x & ~1u, sourceSize.y + (p.y >> 1u));
-    float u = srcTex.Load(int3(chroma, 0)).r * 255.0 - 128.0;
-    float v = srcTex.Load(int3(chroma + uint2(1u, 0u), 0)).r * 255.0 - 128.0;
+    float y = lumaTex.Load(int3(p, 0)) * 255.0 - 16.0;
+    float2 uv2 = chromaTex.Load(int3(p >> 1u, 0)) * 255.0 - 128.0;
+    float u = uv2.x;
+    float v = uv2.y;
     float b = clamp((298.0 * y + 541.0 * u + 128.0) / (256.0 * 255.0), 0.0, 1.0);
     float g = clamp((298.0 * y - 55.0 * u - 136.0 * v + 128.0) / (256.0 * 255.0), 0.0, 1.0);
     float r = clamp((298.0 * y + 459.0 * v + 128.0) / (256.0 * 255.0), 0.0, 1.0);
@@ -129,7 +135,7 @@ impl Gpu {
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 Some(&levels),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -139,6 +145,12 @@ impl Gpu {
         }
         let device = device.expect("D3D11CreateDevice returned no device");
         let context = context.expect("D3D11CreateDevice returned no context");
+        // The decoder thread uses this device too.
+        if let Ok(mt) = context.cast::<ID3D11Multithread>() {
+            unsafe {
+                let _ = mt.SetMultithreadProtected(true);
+            }
+        }
 
         // The DXGI factory that created the device is the one that must create its
         // swapchains.
@@ -226,7 +238,7 @@ impl Gpu {
         width: u32,
         height: u32,
         mode: RenderMode,
-        source: Option<&ID3D11ShaderResourceView>,
+        source: Option<&[Option<ID3D11ShaderResourceView>; 2]>,
         source_size: [u32; 2],
     ) {
         let params = match mode {
@@ -291,52 +303,39 @@ impl Gpu {
                 .PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            if let Some(srv) = source {
-                self.context
-                    .PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+            if let Some(planes) = source {
+                self.context.PSSetShaderResources(0, Some(planes));
             }
             self.context.Draw(3, 0);
         }
     }
 }
 
-/// A shared single-channel texture holding a packed NV12 frame: the Y plane is
-/// followed by the interleaved UV plane. Each proxy window samples its sub-rect
-/// from it and the pixel shader performs BT.709 limited-range conversion. This
-/// keeps the decoder→GPU upload at 1.5 bytes/pixel instead of expanding to
-/// 4 bytes/pixel on the CPU.
+/// A shared NV12 texture holding a lane's frame, with a view of each plane.
+/// Each proxy window samples its sub-rect from it and the pixel shader performs
+/// BT.709 limited-range conversion. A hardware decoder fills it GPU to GPU; a
+/// software one uploads 1.5 bytes/pixel instead of expanding to 4 on the CPU.
 pub struct SourceTexture {
     pub width: u32,
     pub height: u32,
     texture: ID3D11Texture2D,
-    pub srv: ID3D11ShaderResourceView,
+    /// Luma (R8) and chroma (R8G8) views.
+    pub planes: [Option<ID3D11ShaderResourceView>; 2],
 }
 
 impl SourceTexture {
-    /// Create a packed NV12 source texture, initialized to a neutral checkerboard
-    /// so that before any video frame arrives the windows still show a sharp
+    /// Create an NV12 source texture, initialized to a neutral checkerboard so
+    /// that before any video frame arrives the windows still show a sharp
     /// pattern rather than garbage.
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> windows::core::Result<SourceTexture> {
-        let width = width.max(2);
-        let height = height.max(2);
-        let packed_height = height + height / 2;
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: packed_height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            ..Default::default()
-        };
+        // NV12 needs even dimensions.
+        let width = (width.max(2) + 1) & !1;
+        let height = (height.max(2) + 1) & !1;
+        let desc = nv12_desc(width, height);
 
         // Seed the Y plane with a coarse checkerboard and the UV plane with neutral
         // chroma. An unfed texture is obviously a placeholder, not a decode artifact.
+        let packed_height = height + height / 2;
         let mut pixels = vec![128u8; (width as usize) * (packed_height as usize)];
         for y in 0..height as usize {
             for x in 0..width as usize {
@@ -357,24 +356,21 @@ impl SourceTexture {
                 .CreateTexture2D(&desc, Some(&init), Some(&mut texture))?
         };
         let texture = texture.unwrap();
-
-        let mut srv: Option<ID3D11ShaderResourceView> = None;
-        unsafe {
-            gpu.device
-                .CreateShaderResourceView(&texture, None, Some(&mut srv))?
-        };
+        let planes = [
+            Some(plane_view(gpu, &texture, DXGI_FORMAT_R8_UNORM)?),
+            Some(plane_view(gpu, &texture, DXGI_FORMAT_R8G8_UNORM)?),
+        ];
 
         Ok(SourceTexture {
             width,
             height,
             texture,
-            srv: srv.expect("CreateShaderResourceView returned no view"),
+            planes,
         })
     }
 
-    /// Replace the packed NV12 texture with a freshly decoded frame. The decoder
-    /// may provide padded rows, so `stride` is passed separately from the image
-    /// width.
+    /// Replace the frame with a software-decoded one: Y rows then UV rows, each
+    /// `stride` bytes (the decoder may pad rows beyond the image width).
     pub fn update_nv12(&self, gpu: &Gpu, nv12: &[u8], stride: usize) {
         let needed = stride.saturating_mul(self.height as usize * 3 / 2);
         if stride < self.width as usize || nv12.len() < needed {
@@ -392,6 +388,12 @@ impl SourceTexture {
         }
     }
 
+    /// Replace the frame with a hardware-decoded one, GPU to GPU. `frame` must be
+    /// an NV12 texture of the same size.
+    pub fn copy_from(&self, gpu: &Gpu, frame: &ID3D11Texture2D) {
+        unsafe { gpu.context.CopyResource(&self.texture, frame) };
+    }
+
     /// The UV sub-rect (origin + size in [0,1]) for a window's source rect.
     pub fn uv_rect(&self, x: u32, y: u32, w: u32, h: u32) -> [f32; 4] {
         [
@@ -401,6 +403,48 @@ impl SourceTexture {
             h as f32 / self.height as f32,
         ]
     }
+}
+
+/// A default-usage NV12 texture the shaders can read.
+pub fn nv12_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
+    D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        ..Default::default()
+    }
+}
+
+/// A view of one plane of an NV12 texture: R8 is luma, R8G8 chroma.
+fn plane_view(
+    gpu: &Gpu,
+    texture: &ID3D11Texture2D,
+    format: DXGI_FORMAT,
+) -> windows::core::Result<ID3D11ShaderResourceView> {
+    let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
+        },
+    };
+    let mut srv: Option<ID3D11ShaderResourceView> = None;
+    unsafe {
+        gpu.device
+            .CreateShaderResourceView(texture, Some(&desc), Some(&mut srv))?
+    };
+    Ok(srv.expect("CreateShaderResourceView returned no view"))
 }
 
 /// Compile one HLSL entry point, returning the bytecode blob or a descriptive
@@ -439,5 +483,92 @@ fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
         let ptr = blob.GetBufferPointer() as *const u8;
         let len = blob.GetBufferSize();
         std::slice::from_raw_parts(ptr, len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_USAGE_STAGING,
+    };
+
+    /// An NV12 frame drawn through the real shader comes out in the right
+    /// colors at the right pixels: left half red, right half blue.
+    #[test]
+    #[ignore = "Requires a D3D11 GPU; run on target PC"]
+    fn nv12_planes_render_through_the_shader() {
+        let (w, h) = (64u32, 32u32);
+        let gpu = Gpu::new().unwrap();
+        let source = SourceTexture::new(&gpu, w, h).unwrap();
+        // BT.709 limited: red Y=63 U=102 V=240, blue Y=32 U=240 V=118.
+        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                nv12[(y * w + x) as usize] = if x < w / 2 { 63 } else { 32 };
+            }
+        }
+        for y in 0..h / 2 {
+            for x in (0..w).step_by(2) {
+                let (u, v) = if x < w / 2 { (102, 240) } else { (240, 118) };
+                let i = (w * h + y * w + x) as usize;
+                nv12[i] = u;
+                nv12[i + 1] = v;
+            }
+        }
+        source.update_nv12(&gpu, &nv12, w as usize);
+
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let mut target = None;
+            gpu.device.CreateTexture2D(&desc, None, Some(&mut target)).unwrap();
+            let target = target.unwrap();
+            let mut rtv = None;
+            gpu.device
+                .CreateRenderTargetView(&target, None, Some(&mut rtv))
+                .unwrap();
+            gpu.draw(
+                rtv.as_ref().unwrap(),
+                w,
+                h,
+                RenderMode::Source {
+                    uv_rect: source.uv_rect(0, 0, w, h),
+                },
+                Some(&source.planes),
+                [source.width, source.height],
+            );
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+            let mut staging = None;
+            gpu.device.CreateTexture2D(&desc, None, Some(&mut staging)).unwrap();
+            let staging = staging.unwrap();
+            gpu.context.CopyResource(&staging, &target);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+            let pixel = |x: u32, y: u32| {
+                let p = (mapped.pData as *const u8).add((y * mapped.RowPitch + x * 4) as usize);
+                [*p, *p.add(1), *p.add(2)] // B, G, R
+            };
+            let (left, right) = (pixel(5, 20), pixel(w - 5, 20));
+            gpu.context.Unmap(&staging, 0);
+            assert!(left[2] > 230 && left[0] < 25 && left[1] < 25, "left {left:?}");
+            assert!(right[0] > 230 && right[2] < 25 && right[1] < 25, "right {right:?}");
+        }
     }
 }

@@ -56,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 #[cfg(windows)]
-use super::decode::{DecoderInput, DecoderWorker, Wake};
+use super::decode::{DecoderInput, DecoderWorker, GpuDevice, Wake};
 
 struct NativeEvent {
     hwnd: HWND,
@@ -635,7 +635,8 @@ impl App {
                     let wake: Wake = Arc::new(move || unsafe {
                         let _ = SetEvent(HANDLE(wake.0 as _));
                     });
-                    match DecoderWorker::start(hvcc, l.vds.w, l.vds.h, wake) {
+                    let device = Some(GpuDevice(self.gpu.device.clone()));
+                    match DecoderWorker::start(hvcc, l.vds.w, l.vds.h, wake, device) {
                         Ok(d) => {
                             if let Ok(mut inputs) = self.video_inputs.lock() {
                                 inputs.insert(lane, d.input().clone());
@@ -725,10 +726,15 @@ impl App {
             return;
         };
         if let (Some(frame), Some(source)) = (frame, lane.source.as_ref()) {
-            source.update_nv12(&self.gpu, &frame.nv12, frame.stride);
+            match &frame.texture {
+                Some(texture) => source.copy_from(&self.gpu, &texture.0),
+                None => source.update_nv12(&self.gpu, &frame.nv12, frame.stride),
+            }
             lane.shown = Some(frame.stamps);
-            self.dashboard
-                .update_previews_nv12(id, &frame.nv12, frame.stride, lane.vds);
+            if !frame.nv12.is_empty() {
+                self.dashboard
+                    .update_previews_nv12(id, &frame.nv12, frame.stride, lane.vds);
+            }
             lane.video_decoded += 1;
             let first = lane.video_decoded == 1;
             let recovered = self.video_notice.take().is_some();

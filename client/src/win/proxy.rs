@@ -196,7 +196,7 @@ impl Proxy {
             draw_w,
             draw_h,
             mode,
-            source_tex.map(|t| &t.srv),
+            source_tex.map(|t| &t.planes),
             source_tex.map(|t| [t.width, t.height]).unwrap_or([1, 1]),
         );
 
