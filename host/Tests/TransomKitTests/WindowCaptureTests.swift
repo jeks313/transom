@@ -30,6 +30,14 @@ struct WindowCaptureTests {
             displayWidth: 3840, displayHeight: 2160) == WireRect(x: 0, y: 0, w: 3840, h: 2160))
     }
 
+    @Test("tiny non-app windows are helpers, app windows and alerts are not")
+    func helpers() {
+        #expect(WindowWatcher.isHelper(size: CGSize(width: 66, height: 20)) { false })
+        #expect(WindowWatcher.isHelper(size: CGSize(width: 400, height: 30)) { false })
+        #expect(!WindowWatcher.isHelper(size: CGSize(width: 66, height: 20)) { true })
+        #expect(!WindowWatcher.isHelper(size: CGSize(width: 260, height: 120)) { false })
+    }
+
     @Test("invalid AX frames cannot become desktop-origin or partial crops")
     func rejectsInvalidCrops() {
         for frame in [CGRect.zero, CGRect.null, CGRect.infinite,

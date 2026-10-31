@@ -249,6 +249,22 @@ public final class WindowWatcher: @unchecked Sendable {
     /// not minimized and not in a full-screen Space of its own.
     private static func isOnDisplay(_ win: AXWindow) -> Bool {
         win.role == (kAXWindowRole as String) && !win.isMinimized && !win.isFullScreen
+            && !isHelper(win)
+    }
+
+    /// Below this (points), a window that is not an app window is a helper.
+    static let helperMaxSize = CGSize(width: 100, height: 60)
+
+    /// A tiny window an app keeps for itself, such as the 66x20 pt untitled
+    /// `AXDialog` each of Safari and Chrome owns. It is no use to the client and
+    /// would show there as an empty "Window". Real alerts and panels are larger.
+    static func isHelper(size: CGSize, isAppWindow: () -> Bool) -> Bool {
+        (size.width < helperMaxSize.width || size.height < helperMaxSize.height) && !isAppWindow()
+    }
+
+    private static func isHelper(_ win: AXWindow) -> Bool {
+        guard let frame = win.frame() else { return false }
+        return isHelper(size: frame.size) { win.isAppWindow }
     }
 
     private static func processIsAlive(_ pid: pid_t) -> Bool {
