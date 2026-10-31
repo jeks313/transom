@@ -40,9 +40,6 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     private let queue = DispatchQueue(label: "one.transom.host.capture")
     // Accessed only on the capture queue, including explicit refreshes.
     private var lastPixelPTS = CMTime.invalid
-    private var lastEmission = DispatchTime.now().uptimeNanoseconds
-    /// Whether the newest emission was a captured frame, not a refresh of one.
-    private var lastWasCapture = false
 
     private let lock = NSLock()
     private var stream: SCStream?
@@ -62,8 +59,9 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     /// this never touches `CGImage`, so nothing round-trips through the CPU (I-1
     /// pipeline note). The buffer belongs to SCK's pool; use it **synchronously**
     /// (encode it now). Do not retain it past the call or the pool may recycle it
-    /// underneath you.
-    public var onPixelBuffer: (@Sendable (CVPixelBuffer, CMTime) -> Void)?
+    /// underneath you. The rects are what changed since the last frame, in its
+    /// pixels; nil for a refresh of the last frame.
+    public var onPixelBuffer: (@Sendable (CVPixelBuffer, CMTime, [CGRect]?) -> Void)?
 
     public init(
         display: DisplayInfo, fps: Int = 60, applicationPIDs: Set<pid_t>? = nil,
@@ -215,46 +213,27 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     }
 
     /// SCK emits no complete frames while a display is idle. Feed its retained
-    /// native-size image through the encoder on connect, then once more to
-    /// release a decoder's one-frame pipeline delay. This changes no Mac UI.
+    /// native-size image through the encoder on connect or when a keyframe is
+    /// asked for (the hook gets no dirty rects). This changes no Mac UI.
     public func requestRefresh() {
         queue.async { [weak self] in self?.refreshOnCaptureQueue() }
-        queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.refreshOnCaptureQueue()
-        }
-    }
-
-    /// SCK stops producing complete samples when the screen settles. A decoder
-    /// can still hold the final frame, or be waiting for a recovery keyframe, so
-    /// once the screen has been still for 100 ms the last frame is sent once more.
-    /// Only once: every refresh occupies the one hardware encoder (a 5K frame
-    /// takes ~23 ms), and a real frame arriving behind one waits for it.
-    public func requestIdleRefresh() {
-        queue.async { [weak self] in
-            guard let self, self.lastWasCapture,
-                DispatchTime.now().uptimeNanoseconds - self.lastEmission >= 100_000_000
-            else { return }
-            self.refreshOnCaptureQueue()
-        }
     }
 
     private func refreshOnCaptureQueue() {
         let buffer = lock.withLock { stream == nil ? nil : latestPixelBuffer }
         guard let buffer else { return }
-        emitPixelBuffer(buffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
-        lastWasCapture = false
+        emitPixelBuffer(buffer, pts: CMClockGetTime(CMClockGetHostTimeClock()), dirty: nil)
     }
 
-    private func emitPixelBuffer(_ buffer: CVPixelBuffer, pts: CMTime) {
+    private func emitPixelBuffer(_ buffer: CVPixelBuffer, pts: CMTime, dirty: [CGRect]?) {
         guard let pixelHook = onPixelBuffer else { return }
         // A captured sample can have been queued before an explicit refresh.
         // Keep encoder timestamps monotonic without altering any pixels.
         let timestamp = lastPixelPTS.isValid && CMTimeCompare(pts, lastPixelPTS) <= 0
             ? CMTimeAdd(lastPixelPTS, CMTime(value: 1, timescale: 1_000_000)) : pts
         lastPixelPTS = timestamp
-        lastEmission = DispatchTime.now().uptimeNanoseconds
         let signpostState = Log.signposter.beginInterval("capture")
-        pixelHook(buffer, timestamp)
+        pixelHook(buffer, timestamp, dirty)
         Log.signposter.endInterval("capture", signpostState)
     }
 
@@ -321,8 +300,12 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
         // Zero-copy tap first: hand the raw IOSurface buffer straight to the
         // encoder before spending anything on the CGImage path (I-1). Signposted
         // so the capture→handoff interval is measurable in Instruments.
-        emitPixelBuffer(pixelBuffer, pts: sampleBuffer.presentationTimeStamp)
-        lastWasCapture = true
+        // What changed, in the frame's pixels. Without the attachment, all of it.
+        let dirty =
+            (attachments.first?[.dirtyRects] as? [NSDictionary])?
+            .compactMap { CGRect(dictionaryRepresentation: $0) }
+            ?? [CGRect(x: 0, y: 0, width: dw, height: dh)]
+        emitPixelBuffer(pixelBuffer, pts: sampleBuffer.presentationTimeStamp, dirty: dirty)
 
         if let frameHook {
             let image = ctx.createCGImage(

@@ -150,8 +150,8 @@ impl Proxy {
         }
     }
 
-    /// Draw one frame and present. `source_tex` is the shared decoded VDS texture;
-    /// `None` (or checkerboard mode) draws a diagnostic instead.
+    /// Draw one frame and present. `source_tex` is this window's own decoded
+    /// stream (v4); `None` (or checkerboard mode) draws a diagnostic instead.
     pub fn render(&mut self, gpu: &Gpu, source_tex: Option<&SourceTexture>) {
         if self.ensure_rtv(gpu).is_err() {
             return;
@@ -162,19 +162,24 @@ impl Proxy {
 
         // While waiting for a resize acknowledgement, crop/letterbox at native
         // scale. Only an actual interactive resize may stretch the pixels.
+        // The stream is the window's own pixels, which can lag its rect while a
+        // new size's encoder starts.
         let stretch = self.in_size_move && self.resizing;
+        let (tex_w, tex_h) = source_tex
+            .map(|t| (t.width, t.height))
+            .unwrap_or((self.source.w, self.source.h));
         let draw_w = if stretch || self.checkerboard {
             self.width
         } else {
-            self.width.min(self.source.w).max(1)
+            self.width.min(tex_w).max(1)
         };
         let draw_h = if stretch || self.checkerboard {
             self.height
         } else {
-            self.height.min(self.source.h).max(1)
+            self.height.min(tex_h).max(1)
         };
-        let crop_w = if stretch { self.source.w } else { draw_w };
-        let crop_h = if stretch { self.source.h } else { draw_h };
+        let crop_w = if stretch { tex_w } else { draw_w };
+        let crop_h = if stretch { tex_h } else { draw_h };
         if draw_w != self.width || draw_h != self.height {
             unsafe {
                 gpu.context
@@ -185,7 +190,7 @@ impl Proxy {
             RenderMode::Checkerboard
         } else if let Some(tex) = source_tex {
             RenderMode::Source {
-                uv_rect: tex.uv_rect(self.source.x, self.source.y, crop_w, crop_h),
+                uv_rect: tex.uv_rect(0, 0, crop_w, crop_h),
             }
         } else {
             RenderMode::Waiting

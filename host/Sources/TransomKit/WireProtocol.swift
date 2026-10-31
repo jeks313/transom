@@ -80,7 +80,7 @@ public enum ResizePhase: String, Codable, Sendable {
 }
 
 /// The protocol version carried in `hello`. Bump on any breaking wire change.
-public let transomProtocolVersion = 3
+public let transomProtocolVersion = 4
 
 /// The host clock every timestamp on the wire uses: microseconds of
 /// `mach_absolute_time` uptime, the clock ScreenCaptureKit stamps frames with.
@@ -120,9 +120,9 @@ public enum ClientMessage: Sendable, Equatable {
     case requestResize(id: UInt64, size: WireSize, phase: ResizePhase)
     case requestFocus(id: UInt64)
     case requestClose(id: UInt64)
-    /// The client dropped stale compressed frames and needs a new intra frame on
-    /// `lane`, or on every lane when nil.
-    case requestKeyframe(lane: UInt32?)
+    /// The client dropped stale compressed frames and needs a new intra frame of
+    /// window `id`'s stream, or of every stream when nil (v4).
+    case requestKeyframe(id: UInt64?)
     /// A click/type/scroll targeted at window `id` (issue #7). `event` carries
     /// window-local physical pixels / Windows VK codes (see `InputEvent`); `ts` is
     /// the client's monotonic timestamp in milliseconds, opaque to the host in v1.
@@ -266,9 +266,9 @@ extension ClientMessage: Codable {
         case .requestClose(let id):
             try c.encode("requestClose", forKey: .type)
             try c.encode(id, forKey: .id)
-        case .requestKeyframe(let lane):
+        case .requestKeyframe(let id):
             try c.encode("requestKeyframe", forKey: .type)
-            try c.encodeIfPresent(lane, forKey: .lane)
+            try c.encodeIfPresent(id, forKey: .id)
         case .input(let id, let event, let ts):
             try c.encode("input", forKey: .type)
             try c.encode(id, forKey: .id)
@@ -302,7 +302,7 @@ extension ClientMessage: Codable {
         case "requestClose":
             self = .requestClose(id: try c.decode(UInt64.self, forKey: .id))
         case "requestKeyframe":
-            self = .requestKeyframe(lane: try c.decodeIfPresent(UInt32.self, forKey: .lane))
+            self = .requestKeyframe(id: try c.decodeIfPresent(UInt64.self, forKey: .id))
         case "input":
             self = .input(
                 id: try c.decode(UInt64.self, forKey: .id),
@@ -367,24 +367,26 @@ public enum WireCodec {
 /// per-frame at 60fps, so JSON would be wrong here: each framed message on the
 /// video transport is one of these, distinguished by a leading type byte.
 ///
-/// Every message names its lane right after the type byte, so one connection
-/// carries every lane's stream (v2).
+/// Every message names its stream right after the type byte: the id of the
+/// window it shows (v4). Each window is encoded on its own, at its own size.
 ///
-/// - `config` (0x01): `lane: u32` · the HEVC `hvcC` parameter sets. Sent once per
-///   lane before its first frame (and again after a reconnect), because an `hvc1`
-///   stream carries no inline parameter sets and the decoder needs them first.
-/// - `frame` (0x02): `lane: u32` · `seq: u64` · `ptsMicros: u64` · `flags: u8`
-///   (bit0 = keyframe) · the HEVC access-unit bytes. All integers big-endian.
+/// - `config` (0x01): `stream: u64` · `width: u32` · `height: u32` · the HEVC
+///   `hvcC` parameter sets. Sent before a stream's first frame, after a
+///   reconnect, and whenever the window's size gives it a new encoder.
+/// - `frame` (0x02): `stream: u64` · `seq: u64` · `ptsMicros: u64` · `flags: u8`
+///   (bit0 = keyframe) · captured, encoded and sent stamps (`u64` each) · the
+///   HEVC access-unit bytes. All integers big-endian.
 public enum VideoWire {
+    /// Every message names its stream: the id of the window it shows (v4).
     public enum Message: Equatable, Sendable {
-        case config(lane: UInt32, hvcc: Data)
+        case config(stream: UInt64, width: UInt32, height: UInt32, hvcc: Data)
         case frame(
-            lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, timing: FrameTiming,
+            stream: UInt64, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, timing: FrameTiming,
             data: Data)
     }
 
     /// When a frame passed each host stage, on `HostClock` (v3). `ptsMicros` is
-    /// when it was composited; these follow it.
+    /// when it was due on screen; these follow it.
     public struct FrameTiming: Equatable, Sendable {
         /// The capture callback handed it to the encoder.
         public var capturedMicros: UInt64
@@ -399,20 +401,29 @@ public enum VideoWire {
         }
     }
 
-    public static func encodeConfig(lane: UInt32, hvcc: Data) -> Data {
+    /// tag(1) stream(8) width(4) height(4).
+    static let configHeaderLength = 17
+    /// tag(1) stream(8) seq(8) pts(8) flags(1) captured(8) encoded(8) sent(8).
+    static let frameHeaderLength = 50
+
+    public static func encodeConfig(stream: UInt64, width: UInt32, height: UInt32, hvcc: Data)
+        -> Data
+    {
         var out = Data([0x01])
-        out.append(contentsOf: bigEndianBytes(UInt64(lane)).suffix(4))
+        out.append(contentsOf: bigEndianBytes(stream))
+        out.append(contentsOf: bigEndianBytes(UInt64(width)).suffix(4))
+        out.append(contentsOf: bigEndianBytes(UInt64(height)).suffix(4))
         out.append(hvcc)
         return out
     }
 
     public static func encodeFrame(
-        lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool,
+        stream: UInt64, seq: UInt64, ptsMicros: UInt64, keyframe: Bool,
         timing: FrameTiming = FrameTiming(), data: Data
     ) -> Data {
         var out = Data([0x02])
         out.reserveCapacity(frameHeaderLength + data.count)
-        out.append(contentsOf: bigEndianBytes(UInt64(lane)).suffix(4))
+        out.append(contentsOf: bigEndianBytes(stream))
         out.append(contentsOf: bigEndianBytes(seq))
         out.append(contentsOf: bigEndianBytes(ptsMicros))
         out.append(keyframe ? 1 : 0)
@@ -423,26 +434,24 @@ public enum VideoWire {
         return out
     }
 
-    /// tag(1) lane(4) seq(8) pts(8) flags(1) captured(8) encoded(8) sent(8).
-    static let frameHeaderLength = 46
-
     public static func decode(_ payload: Data) -> Message? {
         let bytes = [UInt8](payload)
-        guard bytes.count >= 5 else { return nil }
-        let lane = bytes[1...4].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        guard bytes.count >= 9 else { return nil }
+        let stream = beUInt64(bytes, 1)
         switch bytes[0] {
         case 0x01:
-            return .config(lane: lane, hvcc: Data(bytes[5...]))
+            guard bytes.count >= configHeaderLength else { return nil }
+            return .config(
+                stream: stream, width: beUInt32(bytes, 9), height: beUInt32(bytes, 13),
+                hvcc: Data(bytes[configHeaderLength...]))
         case 0x02:
             guard bytes.count >= frameHeaderLength else { return nil }
-            let seq = beUInt64(bytes, 5)
-            let pts = beUInt64(bytes, 13)
-            let keyframe = bytes[21] != 0
             let timing = FrameTiming(
-                capturedMicros: beUInt64(bytes, 22), encodedMicros: beUInt64(bytes, 30),
-                sentMicros: beUInt64(bytes, 38))
+                capturedMicros: beUInt64(bytes, 26), encodedMicros: beUInt64(bytes, 34),
+                sentMicros: beUInt64(bytes, 42))
             return .frame(
-                lane: lane, seq: seq, ptsMicros: pts, keyframe: keyframe, timing: timing,
+                stream: stream, seq: beUInt64(bytes, 9), ptsMicros: beUInt64(bytes, 17),
+                keyframe: bytes[25] != 0, timing: timing,
                 data: Data(bytes[frameHeaderLength...]))
         default:
             return nil
@@ -455,6 +464,11 @@ public enum VideoWire {
     private static func beUInt64(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
         var v: UInt64 = 0
         for i in 0..<8 { v = (v << 8) | UInt64(bytes[offset + i]) }
+        return v
+    }
+    private static func beUInt32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+        var v: UInt32 = 0
+        for i in 0..<4 { v = (v << 8) | UInt32(bytes[offset + i]) }
         return v
     }
 }

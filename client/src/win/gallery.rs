@@ -1,7 +1,10 @@
 //! Selector thumbnails are UI previews only. Interactive proxy textures never
 //! pass through this downsampling path.
 use super::glass::{self, rect, Paint};
-use crate::{model::Window, wire::Size};
+use crate::{
+    model::Window,
+    wire::{Rect, Size},
+};
 
 pub const CARD_BASE: usize = 1000;
 pub const CARD_COUNT: usize = 12;
@@ -25,11 +28,18 @@ impl Card {
     pub fn update_preview(&mut self, pixels: &[u8], display: Size) {
         self.update_preview_sized(pixels, display, 480, 270);
     }
-    /// Build a small selector thumbnail directly from decoded NV12. This keeps
-    /// the expensive full-frame YUV→BGRA conversion off the video path; only the
-    /// few pixels needed by visible cards are converted, at the gallery rate.
-    pub fn update_preview_nv12(&mut self, nv12: &[u8], stride: usize, display: Size) {
-        self.update_preview_nv12_sized(nv12, stride, display, 480, 270);
+    /// Build a small selector thumbnail directly from the window's own decoded
+    /// NV12 frame (v4: each window is its own stream). This keeps the expensive
+    /// full-frame YUV→BGRA conversion off the video path; only the few pixels
+    /// needed by visible cards are converted, at the gallery rate.
+    pub fn update_preview_nv12(&mut self, nv12: &[u8], stride: usize, frame: Size) {
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: frame.w,
+            h: frame.h,
+        };
+        self.update_preview_nv12_sized(whole, nv12, stride, frame, 480, 270);
     }
     #[cfg(test)]
     pub fn update_preview_sized(&mut self, pixels: &[u8], display: Size, max_w: u32, max_h: u32) {
@@ -63,13 +73,13 @@ impl Card {
     }
     pub fn update_preview_nv12_sized(
         &mut self,
+        r: Rect,
         nv12: &[u8],
         stride: usize,
         display: Size,
         max_w: u32,
         max_h: u32,
     ) {
-        let r = self.window.source;
         let needed = stride.saturating_mul(display.h as usize * 3 / 2);
         if r.w == 0
             || r.h == 0
@@ -212,7 +222,7 @@ pub unsafe fn draw_glass(card: &Card, p: &Paint<'_>, w: f32, h: f32, focused: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Rect, WindowKind};
+    use crate::wire::WindowKind;
     #[test]
     fn preview_crops_only_its_window_and_rejects_outside_rects() {
         let mut c = Card::new(

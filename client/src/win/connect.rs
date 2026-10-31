@@ -98,7 +98,7 @@ struct State {
     list: bool,
     sort_name: bool,
     /// Per lane, when its previews were last refreshed.
-    last_preview: HashMap<u32, Instant>,
+    last_preview: HashMap<u64, Instant>,
 }
 pub struct Dashboard {
     pub hwnd: HWND,
@@ -296,18 +296,19 @@ impl Dashboard {
         }
     }
     /// Refresh the cards of `lane`'s windows from its newest decoded frame.
-    pub fn update_previews_nv12(&mut self, lane: u32, nv12: &[u8], stride: usize, display: Size) {
+    /// Window `id`'s own frame, for its card.
+    pub fn update_preview_nv12(&mut self, id: u64, nv12: &[u8], stride: usize, frame: Size) {
         let last = self
             .state
             .last_preview
-            .entry(lane)
+            .entry(id)
             .or_insert_with(|| Instant::now() - Duration::from_secs(1));
         if last.elapsed() < Duration::from_millis(250) {
             return;
         }
         *last = Instant::now();
-        for c in self.state.cards.iter_mut().filter(|c| c.window.lane == lane) {
-            c.update_preview_nv12(nv12, stride, display);
+        for c in self.state.cards.iter_mut().filter(|c| c.window.id == id) {
+            c.update_preview_nv12(nv12, stride, frame);
         }
         unsafe {
             for slot in 0..CARD_COUNT {

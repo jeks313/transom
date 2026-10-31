@@ -115,7 +115,7 @@ struct Encode: AsyncParsableCommand {
         let capture = DisplayCapture(
             display: disp, fps: fps, pixelFormat: format.capturePixelFormat)
         let frameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        capture.onPixelBuffer = { pixelBuffer, pts in
+        capture.onPixelBuffer = { pixelBuffer, pts, _ in
             do {
                 try encoder.encode(pixelBuffer, pts: pts, duration: frameDuration)
             } catch {

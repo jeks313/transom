@@ -65,8 +65,8 @@ struct WireProtocolTests {
             .requestResize(id: 1, size: WireSize(w: 2560, h: 1440), phase: .end),
             .requestFocus(id: 3),
             .requestClose(id: 3),
-            .requestKeyframe(lane: nil),
-            .requestKeyframe(lane: 2),
+            .requestKeyframe(id: nil),
+            .requestKeyframe(id: 2),
             .input(id: 7, event: .mouseDown(x: 12, y: 34, button: .left), ts: 1000),
             .input(id: 7, event: .mouseUp(x: 12, y: 34, button: .right), ts: 1001),
             .input(id: 7, event: .mouseMove(x: 640, y: 480), ts: 1002),
@@ -150,10 +150,10 @@ struct WireProtocolTests {
         #expect(created["app"] as? Int == 9)
     }
 
-    @Test("a requestKeyframe with no lane means every lane")
-    func keyframeWithoutLane() throws {
+    @Test("a requestKeyframe with no id means every window")
+    func keyframeWithoutID() throws {
         let message = try WireCodec.decodeClient(Data(#"{"type":"requestKeyframe"}"#.utf8))
-        #expect(message == .requestKeyframe(lane: nil))
+        #expect(message == .requestKeyframe(id: nil))
     }
 
     @Test("an unknown type is a decode error, not a crash")
@@ -223,8 +223,8 @@ struct WireProtocolTests {
     func videoConfigRoundTrips() {
         let hvcc = Data([1, 2, 3, 4, 5])
         #expect(
-            VideoWire.decode(VideoWire.encodeConfig(lane: 7, hvcc: hvcc))
-                == .config(lane: 7, hvcc: hvcc))
+            VideoWire.decode(VideoWire.encodeConfig(stream: 7, width: 1680, height: 1420, hvcc: hvcc))
+                == .config(stream: 7, width: 1680, height: 1420, hvcc: hvcc))
     }
 
     @Test("video frame round-trips with its header")
@@ -233,14 +233,14 @@ struct WireProtocolTests {
         let timing = VideoWire.FrameTiming(
             capturedMicros: 9_876_600, encodedMicros: 9_880_000, sentMicros: 9_880_100)
         let encoded = VideoWire.encodeFrame(
-            lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true, timing: timing,
-            data: payload)
-        #expect(Array(encoded.prefix(5)) == [0x02, 0x01, 0x02, 0x03, 0x04])
-        #expect(encoded.count == 46 + payload.count)
+            stream: 0x0102_0304_0506_0708, seq: 12_345, ptsMicros: 9_876_543, keyframe: true,
+            timing: timing, data: payload)
+        #expect(Array(encoded.prefix(9)) == [0x02, 1, 2, 3, 4, 5, 6, 7, 8])
+        #expect(encoded.count == 50 + payload.count)
         #expect(
             VideoWire.decode(encoded)
                 == .frame(
-                    lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true,
-                    timing: timing, data: payload))
+                    stream: 0x0102_0304_0506_0708, seq: 12_345, ptsMicros: 9_876_543,
+                    keyframe: true, timing: timing, data: payload))
     }
 }

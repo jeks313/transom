@@ -12,12 +12,17 @@ pub enum VideoMessage {
     /// `0x01` — the lane's HEVC `hvcC` configuration record (VPS/SPS/PPS).
     /// Sent before the lane's first frame and again after a reconnect; an `hvc1`
     /// stream carries no inline parameter sets, so the decoder needs this first.
-    Config { lane: u32, hvcc: Vec<u8> },
+    Config {
+        stream: u64,
+        width: u32,
+        height: u32,
+        hvcc: Vec<u8>,
+    },
     /// `0x02` — one access unit of `lane`: monotonic `seq`, host-clock
     /// `pts_micros` (when it was composited), a keyframe flag, when it passed
     /// each host stage (v3), and the raw HEVC bytes.
     Frame {
-        lane: u32,
+        stream: u64,
         seq: u64,
         pts_micros: u64,
         keyframe: bool,
@@ -59,11 +64,13 @@ impl std::fmt::Display for VideoDecodeError {
 
 impl std::error::Error for VideoDecodeError {}
 
-/// The header every message starts with: tag(1) + lane(4).
-const LANE_HEADER_LEN: usize = 1 + 4;
-/// The fixed frame header: tag(1) + lane(4) + seq(8) + pts(8) + flags(1) +
+/// The header every message starts with: tag(1) + stream(8), the window id.
+const STREAM_HEADER_LEN: usize = 1 + 8;
+/// The config header: stream header + width(4) + height(4).
+const CONFIG_HEADER_LEN: usize = STREAM_HEADER_LEN + 4 + 4;
+/// The fixed frame header: stream header + seq(8) + pts(8) + flags(1) +
 /// captured(8) + encoded(8) + sent(8).
-const FRAME_HEADER_LEN: usize = LANE_HEADER_LEN + 8 + 8 + 1 + 24;
+const FRAME_HEADER_LEN: usize = STREAM_HEADER_LEN + 8 + 8 + 1 + 24;
 
 impl VideoMessage {
     /// Decode one de-framed video-channel payload.
@@ -72,38 +79,46 @@ impl VideoMessage {
         if tag != 0x01 && tag != 0x02 {
             return Err(VideoDecodeError::UnknownTag(tag));
         }
-        if payload.len() < LANE_HEADER_LEN {
+        if payload.len() < STREAM_HEADER_LEN {
             return Err(VideoDecodeError::TruncatedFrame(payload.len()));
         }
-        let lane = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+        let stream = be_u64(&payload[1..9]);
         match tag {
-            0x01 => Ok(VideoMessage::Config {
-                lane,
-                hvcc: payload[LANE_HEADER_LEN..].to_vec(),
-            }),
+            0x01 => {
+                if payload.len() < CONFIG_HEADER_LEN {
+                    return Err(VideoDecodeError::TruncatedFrame(payload.len()));
+                }
+                Ok(VideoMessage::Config {
+                    stream,
+                    width: be_u32(&payload[9..13]),
+                    height: be_u32(&payload[13..17]),
+                    hvcc: payload[CONFIG_HEADER_LEN..].to_vec(),
+                })
+            }
             _ => {
                 if payload.len() < FRAME_HEADER_LEN {
                     return Err(VideoDecodeError::TruncatedFrame(payload.len()));
                 }
-                let seq = be_u64(&payload[5..13]);
-                let pts_micros = be_u64(&payload[13..21]);
-                let keyframe = payload[21] & 0x01 != 0;
                 let timing = FrameTiming {
-                    captured_micros: be_u64(&payload[22..30]),
-                    encoded_micros: be_u64(&payload[30..38]),
-                    sent_micros: be_u64(&payload[38..46]),
+                    captured_micros: be_u64(&payload[26..34]),
+                    encoded_micros: be_u64(&payload[34..42]),
+                    sent_micros: be_u64(&payload[42..50]),
                 };
                 Ok(VideoMessage::Frame {
-                    lane,
-                    seq,
-                    pts_micros,
-                    keyframe,
+                    stream,
+                    seq: be_u64(&payload[9..17]),
+                    pts_micros: be_u64(&payload[17..25]),
+                    keyframe: payload[25] & 0x01 != 0,
                     timing,
                     data: payload[FRAME_HEADER_LEN..].to_vec(),
                 })
             }
         }
     }
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 fn be_u64(bytes: &[u8]) -> u64 {
@@ -118,9 +133,9 @@ mod tests {
 
     /// Reproduce the host's `VideoWire.encodeFrame` byte layout so the test pins
     /// the wire format, not just this module's own round-trip.
-    fn host_encode_frame(lane: u32, seq: u64, pts: u64, keyframe: bool, data: &[u8]) -> Vec<u8> {
+    fn host_encode_frame(stream: u64, seq: u64, pts: u64, keyframe: bool, data: &[u8]) -> Vec<u8> {
         let mut out = vec![0x02];
-        out.extend_from_slice(&lane.to_be_bytes());
+        out.extend_from_slice(&stream.to_be_bytes());
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(&pts.to_be_bytes());
         out.push(if keyframe { 1 } else { 0 });
@@ -133,12 +148,17 @@ mod tests {
 
     #[test]
     fn decodes_config() {
-        let mut payload = vec![0x01, 0, 0, 0, 7];
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&7u64.to_be_bytes());
+        payload.extend_from_slice(&1680u32.to_be_bytes());
+        payload.extend_from_slice(&1420u32.to_be_bytes());
         payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         assert_eq!(
             VideoMessage::decode(&payload).unwrap(),
             VideoMessage::Config {
-                lane: 7,
+                stream: 7,
+                width: 1680,
+                height: 1420,
                 hvcc: vec![0xDE, 0xAD, 0xBE, 0xEF]
             }
         );
@@ -146,11 +166,11 @@ mod tests {
 
     #[test]
     fn decodes_keyframe() {
-        let payload = host_encode_frame(0x0102_0304, 1, 16_000, true, &[1, 2, 3]);
+        let payload = host_encode_frame(0x0102_0304_0506_0708, 1, 16_000, true, &[1, 2, 3]);
         assert_eq!(
             VideoMessage::decode(&payload).unwrap(),
             VideoMessage::Frame {
-                lane: 0x0102_0304,
+                stream: 0x0102_0304_0506_0708,
                 seq: 1,
                 pts_micros: 16_000,
                 keyframe: true,
@@ -185,11 +205,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_short_frame() {
-        // Tag + lane only: well under the 46-byte frame header.
+    fn rejects_short_messages() {
+        // Tag + stream only: well under the 50-byte frame header.
         assert_eq!(
-            VideoMessage::decode(&[0x02, 0, 0, 0, 0]),
-            Err(VideoDecodeError::TruncatedFrame(5))
+            VideoMessage::decode(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(VideoDecodeError::TruncatedFrame(9))
         );
         assert_eq!(
             VideoMessage::decode(&[0x01, 0, 0]),

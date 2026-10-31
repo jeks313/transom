@@ -30,7 +30,7 @@ pub use input::{InputEvent, MouseButton};
 pub use video::{FrameTiming, VideoDecodeError, VideoMessage};
 
 /// The protocol version this client speaks, checked against the host's `hello`.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Product-default TCP ports (protocol.md §1). These are defaults, not wire
 /// constants; the host can be told to use others. The pair avoids macOS

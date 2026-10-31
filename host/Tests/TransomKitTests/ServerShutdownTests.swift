@@ -114,7 +114,7 @@ struct ServerShutdownTests {
 
     @Test("video stop closes the client and rejects queued connections")
     func videoStop() async throws {
-        let server = VideoServer(hvccProvider: { nil })
+        let server = VideoServer()
         let changes = ConnectionChanges()
         await server.setOnConnectionChange { changes.record($0) }
         let transport = ShutdownTransport()

@@ -214,6 +214,10 @@ public final class HostSession: @unchecked Sendable {
     private var videoListener: TCPListener?
     private var controlServer: ControlServer?
     private var videoServer: VideoServer?
+    /// Keeps App Nap off while sharing. Napped, the host's encodes took 17 ms
+    /// for a window the encoder does in 8 (measured 2026-10-30): the throttling
+    /// started about a minute after launch.
+    private var activity: NSObjectProtocol?
     private var eventSink: AsyncStream<(lane: UInt32, event: WindowWatcher.WindowEvent)>.Continuation?
     private var clientSink: AsyncStream<ClientMessage>.Continuation?
     private var tasks: [Task<Void, Never>] = []
@@ -241,7 +245,6 @@ public final class HostSession: @unchecked Sendable {
     /// output, so each output frame can be matched to its input for a latency
     /// measurement. Encoded output is in input order (frame reordering is off), so
     /// front-matching holds within a lane.
-    private var pendingEncodeStarts: [UInt32: [UInt64]] = [:]
     private var latencySamplesMs: [Double] = []
 
     /// Sliding window for the fps/bitrate estimate.
@@ -302,6 +305,9 @@ public final class HostSession: @unchecked Sendable {
     /// immediately gets a full resync. Throws with a plain message if a permission
     /// or bind precondition fails.
     public func start() async throws {
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
+            reason: "Streaming windows to a Transom client")
         do {
             try await startImpl()
         } catch {
@@ -434,12 +440,12 @@ public final class HostSession: @unchecked Sendable {
                         self?.readMenus(pid: pid_t(bitPattern: ControlServer.app(of: id, in: lane.registry)))
                     case .ping:
                         break  // answered by the control server
-                    case let .requestKeyframe(laneID):
+                    case let .requestKeyframe(id):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
                         // chain at once: a still screen sends no next frame.
-                        for lane in lanes where laneID == nil || lane.id == laneID {
-                            lane.encoder?.requestKeyframe()
+                        for lane in lanes where id == nil || lane.registry.entry(for: id!) != nil {
+                            lane.streams?.requestKeyframe(id)
                             lane.capture?.requestRefresh()
                         }
                     }
@@ -691,19 +697,38 @@ public final class HostSession: @unchecked Sendable {
     }
 
     private func startVideo(_ lanes: [Lane]) async throws {
+        // Windows get encoders as they appear; one made now proves the hardware
+        // encoder is there before anyone connects.
+        let probe = try HEVCEncoder(
+            config: HEVCEncoder.Config(width: 256, height: 256, fps: config.fps, format: config.videoFormat))
+        probe.finish()
+        statsLock.withLock { usingHardware = probe.usingHardware }
+
+        let videoServer = VideoServer()
+        self.videoServer = videoServer
+        // Every lane's frames go out in order through one queue. A frame dropped
+        // from it would break its stream, so that stream is restarted at a keyframe.
+        let (frames, frameSink) = AsyncStream.makeStream(
+            of: VideoServer.StreamFrame.self, bufferingPolicy: .bufferingNewest(64))
         for lane in lanes {
             let disp = lane.display
-            let enc = try HEVCEncoder(
-                config: HEVCEncoder.Config(
-                    width: disp.pixelWidth, height: disp.pixelHeight, fps: config.fps,
-                    bitrateBitsPerSecond: config.bitrateMbps * 1_000_000,
-                    // A keyframe of a 5K lane is ~250KB: one every 2s cost a
-                    // latency spike each time. The stream is reliable and the
-                    // client asks for one when it needs it, so this is only a
-                    // backstop.
-                    maxKeyFrameInterval: config.fps * 60, format: config.videoFormat))
-            enc.extractFrameData = true
-            lane.encoder = enc
+            let streams = WindowStreams(
+                registry: lane.registry, fps: config.fps,
+                bitrateBitsPerSecond: config.bitrateMbps * 1_000_000, format: config.videoFormat
+            ) { [weak self, weak lane] item in
+                self?.recordEncodedFrame(item.frame)
+                if case .dropped(let old) = frameSink.yield(item) {
+                    lane?.streams?.requestKeyframe(old.stream)
+                    lane?.capture?.requestRefresh()
+                }
+            }
+            streams.onEncoderCreated = { [weak self] encoder in
+                self?.statsLock.withLock {
+                    self?.usingHardware = (self?.usingHardware ?? false) && encoder.usingHardware
+                    self?.encoderFormatSummary = encoder.outputFormatSummary
+                }
+            }
+            lane.streams = streams
             lane.capture = DisplayCapture(display: disp, fps: config.fps,
                 applicationPIDs: Set(lane.targets.map(\.pid)),
                 pixelFormat: config.videoFormat.capturePixelFormat,
@@ -711,21 +736,11 @@ public final class HostSession: @unchecked Sendable {
                 // draw belongs to whoever is at the Mac, not to the client.
                 showsCursor: config.inputDelivery == .foreground)
         }
-        let hardware = lanes.allSatisfy { $0.encoder?.usingHardware == true }
-        statsLock.withLock { usingHardware = hardware }
-
-        var providers: [UInt32: @Sendable () -> Data?] = [:]
-        for lane in lanes {
-            let enc = lane.encoder
-            providers[lane.id] = { enc?.parameterSetsHVCC }
-        }
-        let videoServer = VideoServer(hvccProviders: providers)
-        self.videoServer = videoServer
         await videoServer.setOnConnectionChange { [weak self] connected in
             self?.statsLock.withLock { self?.videoConnected = connected }
             if connected {
                 for lane in lanes {
-                    lane.encoder?.requestKeyframe()
+                    lane.streams?.requestKeyframe(nil)
                     lane.capture?.requestRefresh()
                 }
             }
@@ -733,48 +748,39 @@ public final class HostSession: @unchecked Sendable {
         let listener = try TCPListener(host: config.host, port: config.videoPort, label: "video")
         self.videoListener = listener
 
-        let frameDuration = CMTimeMake(value: 1, timescale: Int32(config.fps))
         // One lane at a time: two captures starting at once in separate host
         // processes hung in startCapture, so never overlap the starts.
         for lane in lanes {
-            guard let enc = lane.encoder, let cap = lane.capture else { continue }
-            let laneID = lane.id
-            let (frames, frameSink) = AsyncStream.makeStream(
-                of: HEVCEncoder.EncodedFrame.self, bufferingPolicy: .bufferingNewest(4))
-            enc.onEncodedFrame = { [weak self, weak enc] frame in
-                // Read the encoder directly instead of the lane's on a VT thread;
-                // keep it weak so the callback does not retain its own encoder.
-                self?.recordEncodedFrame(
-                    frame, lane: laneID, formatSummary: enc?.outputFormatSummary ?? "unknown")
-                frameSink.yield(frame)
-            }
-            cap.onPixelBuffer = { [weak self] pixelBuffer, pts in
-                self?.markEncodeStart(lane: laneID)
-                try? enc.encode(
-                    pixelBuffer, pts: pts, duration: frameDuration,
-                    capturedMicros: HostClock.micros())
+            guard let streams = lane.streams, let cap = lane.capture else { continue }
+            cap.onPixelBuffer = { pixelBuffer, pts, dirty in
+                streams.process(
+                    pixelBuffer, pts: pts, capturedMicros: HostClock.micros(), dirty: dirty)
             }
             // The prompt lane has nothing to capture until a prompt is adopted.
             if !lane.isPromptLane { try await cap.start() }
-            tasks.append(Task { for await f in frames { await videoServer.send(f, lane: laneID) } })
         }
-
-        try await listener.start()
-        tasks.append(Task { await videoServer.serve(listener: listener) })
-        let captures = lanes.compactMap(\.capture)
         tasks.append(Task {
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(50)) }
-                catch { break }
-                if await videoServer.hasClient {
-                    for cap in captures { cap.requestIdleRefresh() }
+            for await item in frames {
+                if await !videoServer.send(item) {
+                    // Its config has not gone out: start the stream over.
+                    for lane in lanes where lane.registry.entry(for: item.stream) != nil {
+                        lane.streams?.requestKeyframe(item.stream)
+                        lane.capture?.requestRefresh()
+                    }
                 }
             }
         })
+
+        try await listener.start()
+        tasks.append(Task { await videoServer.serve(listener: listener) })
     }
 
     /// Stop everything and reset to a clean state. Safe to call more than once.
     public func stop() async {
+        if let activity {
+            ProcessInfo.processInfo.endActivity(activity)
+            self.activity = nil
+        }
         controlListener?.stop()
         videoListener?.stop()
         await controlServer?.stop()
@@ -782,7 +788,7 @@ public final class HostSession: @unchecked Sendable {
         for lane in lanes {
             if let capture = lane.capture { await capture.stop() }
             lane.injector.releaseFocus()
-            lane.encoder?.finish()
+            lane.streams?.finish()
         }
         eventSink?.finish()
         clientSink?.finish()
@@ -808,7 +814,6 @@ public final class HostSession: @unchecked Sendable {
             videoEnabled = false
             notices = []
             frameSamples = []
-            pendingEncodeStarts = [:]
             latencySamplesMs = []
         }
     }
@@ -855,31 +860,15 @@ public final class HostSession: @unchecked Sendable {
 
     // MARK: - Stats (called from capture / VideoToolbox threads)
 
-    private func markEncodeStart(lane: UInt32) {
-        let now = DispatchTime.now().uptimeNanoseconds
-        statsLock.withLock {
-            pendingEncodeStarts[lane, default: []].append(now)
-            // Bound the queue: if output ever lags input, drop the oldest so the
-            // latency estimate stays fresh instead of drifting unboundedly.
-            if pendingEncodeStarts[lane]!.count > 12 { pendingEncodeStarts[lane]!.removeFirst() }
-        }
-    }
-
-    private func recordEncodedFrame(
-        _ frame: HEVCEncoder.EncodedFrame, lane: UInt32, formatSummary: String
-    ) {
+    private func recordEncodedFrame(_ frame: HEVCEncoder.EncodedFrame) {
         let now = DispatchTime.now().uptimeNanoseconds
         statsLock.withLock {
             totalFrames += 1
-            encoderFormatSummary = formatSummary
             frameSamples.append((t: now, bytes: frame.byteCount))
             trimRateWindowLocked()
-            if let start = pendingEncodeStarts[lane]?.first {
-                pendingEncodeStarts[lane]!.removeFirst()
-                if now >= start {
-                    latencySamplesMs.append(Double(now - start) / 1_000_000)
-                    if latencySamplesMs.count > 60 { latencySamplesMs.removeFirst() }
-                }
+            if frame.encodedMicros >= frame.capturedMicros, frame.capturedMicros > 0 {
+                latencySamplesMs.append(Double(frame.encodedMicros - frame.capturedMicros) / 1000)
+                if latencySamplesMs.count > 60 { latencySamplesMs.removeFirst() }
             }
         }
     }
@@ -908,7 +897,7 @@ public final class HostSession: @unchecked Sendable {
 }
 
 /// One lane's pipeline. Its AX objects are fixed at creation; `capture` and
-/// `encoder` are set once by `startVideo`, and `layoutGuard` is touched only on
+/// `streams` are set once by `startVideo`, and `layoutGuard` is touched only on
 /// the watcher run-loop thread.
 private final class Lane: @unchecked Sendable {
     let id: UInt32
@@ -919,7 +908,7 @@ private final class Lane: @unchecked Sendable {
     let resize: ResizeService
     let injector: InputInjector
     var capture: DisplayCapture?
-    var encoder: HEVCEncoder?
+    var streams: WindowStreams?
     var layoutGuard = LayoutGuard()
     /// The prompt lane's state, touched only on the watcher run-loop thread.
     var isPromptLane = false

@@ -168,11 +168,11 @@ pub enum ClientMessage {
     RequestClose {
         id: u64,
     },
-    /// Ask the host to emit a fresh intra frame on `lane` (every lane when None)
-    /// after a decoder dropped stale compressed frames to stay within the latency
-    /// budget.
+    /// Ask the host to emit a fresh intra frame of window `id`'s stream (every
+    /// window when None) after a decoder dropped stale compressed frames to stay
+    /// within the latency budget.
     RequestKeyframe {
-        lane: Option<u32>,
+        id: Option<u64>,
     },
     Input {
         id: u64,
@@ -409,10 +409,10 @@ impl ClientMessage {
                 ("type", Value::str("requestClose")),
                 ("id", Value::uint(*id)),
             ]),
-            ClientMessage::RequestKeyframe { lane } => {
+            ClientMessage::RequestKeyframe { id } => {
                 let mut fields = vec![("type", Value::str("requestKeyframe"))];
-                if let Some(lane) = lane {
-                    fields.push(("lane", Value::uint(*lane as u64)));
+                if let Some(id) = id {
+                    fields.push(("id", Value::uint(*id)));
                 }
                 Value::object(fields)
             }
@@ -456,13 +456,13 @@ mod tests {
     #[test]
     fn decodes_hello() {
         let msg = ServerMessage::decode(
-            br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
+            br#"{"type":"hello","protocol":4,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
         )
         .unwrap();
         assert_eq!(
             msg,
             ServerMessage::Hello {
-                protocol: 3,
+                protocol: 4,
                 lanes: vec![
                     Lane {
                         lane: 0,
@@ -665,16 +665,16 @@ mod tests {
             r#"{"type":"requestClose","id":9}"#
         );
         assert_eq!(
-            ClientMessage::RequestKeyframe { lane: None }
+            ClientMessage::RequestKeyframe { id: None }
                 .to_value()
                 .to_json(),
             r#"{"type":"requestKeyframe"}"#
         );
         assert_eq!(
-            ClientMessage::RequestKeyframe { lane: Some(2) }
+            ClientMessage::RequestKeyframe { id: Some(2) }
                 .to_value()
                 .to_json(),
-            r#"{"type":"requestKeyframe","lane":2}"#
+            r#"{"type":"requestKeyframe","id":2}"#
         );
     }
 

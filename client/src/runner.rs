@@ -87,7 +87,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let mut frames = 0u64;
     let clock = session.clock();
-    let mut latency: HashMap<u32, LatencyStats> = HashMap::new();
+    let mut latency: HashMap<u64, LatencyStats> = HashMap::new();
     let mut video_bytes = 0u64;
     let mut last_video_report = Instant::now();
 
@@ -125,15 +125,20 @@ pub fn run(args: &[String]) -> ExitCode {
                 apply_for_display(&ev, &mut windows, &mut order);
                 print_control(&ev, now_ms());
             }
-            SessionEvent::Video(VideoEvent::Config { lane, hvcc }) => {
+            SessionEvent::Video(VideoEvent::Config {
+                stream,
+                width,
+                height,
+                hvcc,
+            }) => {
                 println!(
-                    "[{:>6}ms] video: lane {lane} hvcC config, {} bytes (decoder can now start)",
+                    "[{:>6}ms] video: window {stream} stream {width}x{height}, hvcC {} bytes",
                     now_ms(),
                     hvcc.len()
                 );
             }
             SessionEvent::Video(VideoEvent::Frame {
-                lane,
+                stream,
                 seq,
                 keyframe,
                 stamps,
@@ -143,7 +148,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 frames += 1;
                 video_bytes += data.len() as u64;
                 if let Ok(c) = clock.lock() {
-                    latency.entry(lane).or_default().record(&stamps, &c);
+                    latency.entry(stream).or_default().record(&stamps, &c);
                 }
                 // Rate-limit the video log to once a second so it doesn't drown the
                 // control-plane trace.
@@ -160,10 +165,10 @@ pub fn run(args: &[String]) -> ExitCode {
                     if let Some(rtt) = rtt {
                         println!("           rtt {:.1} ms (fastest of recent pings)", rtt as f64 / 1000.0);
                     }
-                    let mut lanes: Vec<_> = latency.iter().collect();
-                    lanes.sort_by_key(|(l, _)| **l);
-                    for (lane, stats) in lanes {
-                        println!("           lane {lane}: {}", stats.summary());
+                    let mut streams: Vec<_> = latency.iter().collect();
+                    streams.sort_by_key(|(id, _)| **id);
+                    for (id, stats) in streams {
+                        println!("           window {id}: {}", stats.summary());
                     }
                     video_bytes = 0;
                     last_video_report = Instant::now();

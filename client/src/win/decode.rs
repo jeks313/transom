@@ -323,6 +323,8 @@ struct Decoder {
     config: HevcConfig,
     width: u32,
     height: u32,
+    /// Rows the decoder's pictures have: the height, padded to its block size.
+    coded_height: u32,
     stride: usize,
     provides_samples: bool,
     out_size: u32,
@@ -513,6 +515,7 @@ impl Decoder {
                         config,
                         width,
                         height,
+                        coded_height: height,
                         stride: width as usize,
                         provides_samples: false,
                         out_size: 0,
@@ -633,12 +636,16 @@ impl Decoder {
             let size = output
                 .GetUINT64(&MF_MT_FRAME_SIZE)
                 .unwrap_or(pack_size(self.width, self.height));
-            if size != pack_size(self.width, self.height) {
+            // A window's size need not be a multiple of the codec's blocks; the
+            // decoder pads its pictures past it, and the padding is cropped off.
+            let (coded_w, coded_h) = ((size >> 32) as u32, size as u32);
+            if !padded_by_block(coded_w, self.width) || !padded_by_block(coded_h, self.height) {
                 return Err(windows::core::Error::new(
                     MF_E_INVALIDMEDIATYPE,
                     "Decoded size differs from host display; refusing to scale",
                 ));
             }
+            self.coded_height = coded_h;
             output.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
             self.transform.SetOutputType(0, &output, 0)?;
             self.stride = output
@@ -661,7 +668,7 @@ impl Decoder {
             two_d
                 .ContiguousCopyTo(&mut packed)
                 .map_err(|e| e.to_string())?;
-            return validate_nv12(packed, self.width, self.height, self.stride);
+            return validate_nv12(packed, self.width, self.height, self.coded_height, self.stride);
         }
         let mut ptr = std::ptr::null_mut();
         let mut len = 0;
@@ -671,7 +678,7 @@ impl Decoder {
         let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
         let unlock = buffer.Unlock();
         unlock.map_err(|e| e.to_string())?;
-        validate_nv12(bytes, self.width, self.height, self.stride)
+        validate_nv12(bytes, self.width, self.height, self.coded_height, self.stride)
     }
 }
 impl Drop for Decoder {
@@ -732,22 +739,46 @@ fn pack_size(width: u32, height: u32) -> u64 {
     ((width as u64) << 32) | height as u64
 }
 
+/// Whether a decoder's picture side `coded` is `side` padded up to a block.
+fn padded_by_block(coded: u32, side: u32) -> bool {
+    coded >= side && coded - side < 64
+}
+
+/// Check a CPU decoder's NV12 picture and drop the rows it padded past
+/// `height`: its chroma plane starts after `coded_height` rows.
 fn validate_nv12(
     nv12: Vec<u8>,
     width: u32,
     height: u32,
+    coded_height: u32,
     stride: usize,
 ) -> Result<DecodedFrame, String> {
     let needed = stride
-        .checked_mul(height as usize)
-        .and_then(|y| y.checked_add(stride.checked_mul(height as usize / 2)?))
+        .checked_mul(coded_height as usize)
+        .and_then(|y| y.checked_add(stride.checked_mul(coded_height as usize / 2)?))
         .ok_or_else(|| "Invalid NV12 output dimensions".to_string())?;
-    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 || stride < width as usize {
+    if width == 0
+        || height == 0
+        || width % 2 != 0
+        || height % 2 != 0
+        || coded_height < height
+        || stride < width as usize
+    {
         return Err("Invalid NV12 output dimensions or stride".into());
     }
     if nv12.len() < needed {
         return Err("Invalid NV12 output buffer size".into());
     }
+    let nv12 = if coded_height == height {
+        nv12
+    } else {
+        let luma = stride * height as usize;
+        let chroma = stride * coded_height as usize;
+        let mut packed = Vec::with_capacity(luma + luma / 2);
+        packed.extend_from_slice(&nv12[..luma]);
+        packed.extend_from_slice(&nv12[chroma..chroma + luma / 2]);
+        packed
+    };
     Ok(DecodedFrame {
         nv12,
         stride,
@@ -808,6 +839,17 @@ mod tests {
         }
     }
     #[test]
+    fn nv12_from_a_block_padded_picture_drops_the_padding_rows() {
+        // 2x2 picture decoded as 2x4: Y rows 1,2 then padding 9,9; UV row 5,6 then 9,9.
+        let coded = vec![1, 1, 2, 2, 9, 9, 9, 9, 5, 6, 9, 9];
+        let frame = validate_nv12(coded, 2, 2, 4, 2).unwrap();
+        assert_eq!(frame.nv12, vec![1, 1, 2, 2, 5, 6]);
+        assert!(padded_by_block(1424, 1420));
+        assert!(padded_by_block(1420, 1420));
+        assert!(!padded_by_block(1418, 1420));
+        assert!(!padded_by_block(2880, 1420));
+    }
+    #[test]
     fn nv12_handles_padding_and_rejects_short_or_odd_frames() {
         let packed = [16, 235, 16, 235, 128, 128];
         let padded = [16, 235, 99, 99, 16, 235, 99, 99, 128, 128, 99, 99];
@@ -849,6 +891,22 @@ mod tests {
         queue.push(encoded(11, true));
         assert!(queue.pop().unwrap().reset);
     }
+    /// The fixture was recorded in v1 framing: no stream after the tag, no size
+    /// in a config, and no stage stamps in a frame.
+    fn fixture_to_v4(p: Vec<u8>) -> Vec<u8> {
+        let mut out = vec![p[0]];
+        out.extend_from_slice(&1u64.to_be_bytes());
+        if p[0] == 0x02 {
+            out.extend_from_slice(&p[1..18]);
+            out.extend_from_slice(&[0; 24]);
+            out.extend_from_slice(&p[18..]);
+        } else {
+            out.extend_from_slice(&128u32.to_be_bytes());
+            out.extend_from_slice(&96u32.to_be_bytes());
+            out.extend_from_slice(&p[1..]);
+        }
+        out
+    }
     #[test]
     #[ignore = "Requires an installed Windows HEVC decoder; run on target PC"]
     fn decodes_hevc_fixture_on_windows() {
@@ -857,21 +915,9 @@ mod tests {
         let _com = ComApartment::new().unwrap();
         let data = include_bytes!("../../tests/fixtures/hevc-main.wire");
         let mut wire = FramedReceiver::new(&data[..]);
-        // The fixture was recorded in v1 framing: no lane after the tag, and a
-        // frame has no stage stamps after its flags (v3).
-        let v3 = |p: Vec<u8>| {
-            let mut out = vec![p[0], 0, 0, 0, 0];
-            if p[0] == 0x02 {
-                out.extend_from_slice(&p[1..18]);
-                out.extend_from_slice(&[0; 24]);
-                out.extend_from_slice(&p[18..]);
-            } else {
-                out.extend_from_slice(&p[1..]);
-            }
-            out
-        };
+        let v4 = fixture_to_v4;
         let VideoMessage::Config { hvcc, .. } =
-            VideoMessage::decode(&v3(wire.recv().unwrap().unwrap())).unwrap()
+            VideoMessage::decode(&v4(wire.recv().unwrap().unwrap())).unwrap()
         else {
             panic!("config expected")
         };
@@ -883,7 +929,7 @@ mod tests {
                 keyframe,
                 pts_micros,
                 ..
-            } = VideoMessage::decode(&v3(payload)).unwrap()
+            } = VideoMessage::decode(&v4(payload)).unwrap()
             else {
                 panic!("frame expected")
             };
@@ -909,41 +955,34 @@ mod tests {
         let gpu = super::super::gpu::Gpu::new().unwrap();
         let data = include_bytes!("../../tests/fixtures/hevc-main.wire");
         let mut wire = FramedReceiver::new(&data[..]);
-        let lane = |p: Vec<u8>| {
-            let mut out = vec![p[0], 0, 0, 0, 0];
-            if p[0] == 0x02 {
-                out.extend_from_slice(&p[1..18]);
-                out.extend_from_slice(&[0; 24]);
-                out.extend_from_slice(&p[18..]);
-            } else {
-                out.extend_from_slice(&p[1..]);
-            }
-            out
-        };
+        let v4 = fixture_to_v4;
         let VideoMessage::Config { hvcc, .. } =
-            VideoMessage::decode(&lane(wire.recv().unwrap().unwrap())).unwrap()
+            VideoMessage::decode(&v4(wire.recv().unwrap().unwrap())).unwrap()
         else {
             panic!("config expected")
         };
         let mut decoder = Decoder::new(&hvcc, 128, 96, Some(gpu.device.clone())).unwrap();
         assert!(decoder.hardware.is_some(), "decoder did not take the device");
         let mut count = 0;
+        let mut inputs = 0;
         while let Some(payload) = wire.recv().unwrap() {
             let VideoMessage::Frame {
                 data,
                 keyframe,
                 pts_micros,
                 ..
-            } = VideoMessage::decode(&lane(payload)).unwrap()
+            } = VideoMessage::decode(&v4(payload)).unwrap()
             else {
                 panic!("frame expected")
             };
+            inputs += 1;
             if let Some(frame) = decoder.decode(&data, keyframe, pts_micros).unwrap() {
                 assert!(frame.texture.is_some());
                 count += 1;
             }
+            // No frame is held back: a single change must show at once.
+            assert_eq!(count, inputs, "decoder held a frame back");
         }
-        assert!(count >= 8, "expected most frames, got {count}");
         // Read the last picture back, waiting this time.
         let hw = decoder.hardware.as_ref().unwrap();
         unsafe {
