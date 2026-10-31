@@ -336,9 +336,11 @@ public final class HEVCEncoder: @unchecked Sendable {
     /// Encode one captured buffer. In the normal 4:2:0 mode ScreenCaptureKit
     /// already supplies the encoder's native NV12 format, so this path skips a
     /// full-frame BGRA→NV12 transfer. The 4:4:4 mode keeps the media-engine
-    /// conversion path.
+    /// conversion path. `done` runs once the encoder has finished with the
+    /// frame, encoded or dropped, on a VideoToolbox thread; not when this throws.
     public func encode(
-        _ source: CVPixelBuffer, pts: CMTime, duration: CMTime, capturedMicros: UInt64 = 0
+        _ source: CVPixelBuffer, pts: CMTime, duration: CMTime, capturedMicros: UInt64 = 0,
+        done: (@Sendable () -> Void)? = nil
     ) throws {
         let state = Log.signposter.beginInterval("encode")
         defer { Log.signposter.endInterval("encode", state) }
@@ -373,6 +375,7 @@ public final class HEVCEncoder: @unchecked Sendable {
         }
 
         let handler: VTCompressionOutputHandler = { [weak self] status, _, sampleBuffer in
+            defer { done?() }
             guard let self, status == noErr, let sampleBuffer else { return }
             self.emit(sampleBuffer, capturedMicros: capturedMicros)
         }

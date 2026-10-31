@@ -16,6 +16,14 @@ import Metal
 ///
 /// `process` runs on the capture queue. A window that changes size gets a new
 /// encoder (`generation` + 1), whose first frame is a keyframe.
+///
+/// Each encoder has at most `maxInFlight` frames in flight. When the encoder
+/// cannot keep up with the capture rate, frames would otherwise queue inside
+/// VideoToolbox, each waiting on the ones before it: a 7 megapixel window at
+/// 120 fps, while the encoder ran slow at 22 ms a frame, fell 42 ms behind. A
+/// frame that arrives while its window is full waits instead, replacing any
+/// older one, and goes when the encoder has room, so the window runs at the
+/// rate its encoder manages.
 public final class WindowStreams: @unchecked Sendable {
     public typealias Sink = @Sendable (VideoServer.StreamFrame) -> Void
 
@@ -26,17 +34,34 @@ public final class WindowStreams: @unchecked Sendable {
     private let sink: Sink
     private let cropper: FrameCropper?
 
-    private final class Stream {
+    /// Unchecked: `crop` stays on the capture queue and the rest is under `lock`.
+    private final class Stream: @unchecked Sendable {
         let encoder: HEVCEncoder
-        let crop: CGRect
+        /// Touched only on the capture queue.
+        var crop: CGRect
         let generation: UInt32
         let pool: CVPixelBufferPool
+        /// Under `WindowStreams.lock`: frames with the encoder, and the newest
+        /// frame waiting for it.
+        var inFlight = 0
+        var waiting: Frame?
+        var closed = false
         init(encoder: HEVCEncoder, crop: CGRect, generation: UInt32, pool: CVPixelBufferPool) {
             self.encoder = encoder
             self.crop = crop
             self.generation = generation
             self.pool = pool
         }
+    }
+    /// Two keep VideoToolbox's pipeline full: one alone adds about 5 ms a frame
+    /// to a big window at 120 fps, and two cost nothing over no limit.
+    static let maxInFlight = 2
+
+    private struct Frame {
+        let buffer: CVPixelBuffer
+        let pts: CMTime
+        let capturedMicros: UInt64
+        let keyframe: Bool
     }
     /// Touched only on the capture queue.
     private var streams: [UInt64: Stream] = [:]
@@ -85,7 +110,7 @@ public final class WindowStreams: @unchecked Sendable {
         let entries = registry.snapshot()
         let live = Set(entries.map(\.id))
         for id in streams.keys where !live.contains(id) {
-            streams[id]?.encoder.finish()
+            if let stream = streams[id] { close(stream) }
             streams[id] = nil
             generations[id] = nil
             failed[id] = nil
@@ -108,17 +133,14 @@ public final class WindowStreams: @unchecked Sendable {
             var stream = streams[entry.id]
             if stream == nil || stream!.crop.size != crop.size {
                 guard failed[entry.id] != crop.size else { continue }
+                if let old = stream { close(old) }
                 stream = makeStream(id: entry.id, crop: crop)
                 streams[entry.id] = stream
                 guard stream != nil else { continue }
                 keyframe = true
             } else if stream!.crop.origin != crop.origin {
                 // Moved: same encoder, new place in the lane.
-                let moved = Stream(
-                    encoder: stream!.encoder, crop: crop, generation: stream!.generation,
-                    pool: stream!.pool)
-                streams[entry.id] = moved
-                stream = moved
+                stream!.crop = crop
             }
             guard let stream, keyframe || changed else { continue }
             work.append((entry.id, stream, keyframe))
@@ -133,17 +155,64 @@ public final class WindowStreams: @unchecked Sendable {
             targets.append(out)
         }
         guard cropper.crop(buffer, rects: work.map(\.stream.crop), into: targets) else { return }
-        let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
         for (item, target) in zip(work, targets) {
-            if item.keyframe { item.stream.encoder.requestKeyframe() }
-            try? item.stream.encoder.encode(
-                target, pts: pts, duration: duration, capturedMicros: capturedMicros)
+            let frame = Frame(
+                buffer: target, pts: pts, capturedMicros: capturedMicros, keyframe: item.keyframe)
+            let send: Bool = lock.withLock {
+                let stream = item.stream
+                guard stream.inFlight >= Self.maxInFlight else {
+                    stream.inFlight += 1
+                    return true
+                }
+                // A keyframe asked for must survive being replaced.
+                let keyframe = frame.keyframe || (stream.waiting?.keyframe ?? false)
+                stream.waiting = Frame(
+                    buffer: frame.buffer, pts: frame.pts, capturedMicros: frame.capturedMicros,
+                    keyframe: keyframe)
+                return false
+            }
+            if send { submit(frame, to: item.stream) }
         }
+    }
+
+    /// Hand `frame` to the stream's encoder, which the caller has counted in
+    /// flight; when it is done, the frame that waited meanwhile goes next.
+    private func submit(_ frame: Frame, to stream: Stream) {
+        if frame.keyframe { stream.encoder.requestKeyframe() }
+        let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+        do {
+            try stream.encoder.encode(
+                frame.buffer, pts: frame.pts, duration: duration,
+                capturedMicros: frame.capturedMicros
+            ) { [weak self, stream] in self?.next(after: stream) }
+        } catch {
+            next(after: stream)
+        }
+    }
+
+    private func next(after stream: Stream) {
+        let frame: Frame? = lock.withLock {
+            guard !stream.closed, let frame = stream.waiting else {
+                stream.inFlight -= 1
+                return nil
+            }
+            stream.waiting = nil
+            return frame
+        }
+        if let frame { submit(frame, to: stream) }
+    }
+
+    private func close(_ stream: Stream) {
+        lock.withLock {
+            stream.closed = true
+            stream.waiting = nil
+        }
+        stream.encoder.finish()
     }
 
     /// Flush and close every encoder.
     public func finish() {
-        for stream in streams.values { stream.encoder.finish() }
+        for stream in streams.values { close(stream) }
         streams = [:]
     }
 
@@ -299,3 +368,4 @@ final class FrameCropper {
         return commands.status == .completed
     }
 }
+
