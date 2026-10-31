@@ -61,6 +61,11 @@ pub enum VideoEvent {
     },
 }
 
+/// Takes video events on the video thread before they are queued for the
+/// consumer: returns the event to queue it, or `None` once it has handled it.
+/// The window manager feeds frames straight to their decoder this way.
+pub type VideoSink = Arc<dyn Fn(VideoEvent) -> Option<VideoEvent> + Send + Sync>;
+
 /// How often the session probes the host clock: fast at first so the offset
 /// settles within a second, then gently.
 const PING_FAST: Duration = Duration::from_millis(100);
@@ -89,6 +94,16 @@ impl Session {
         host: &str,
         control_port: u16,
         video_port: Option<u16>,
+    ) -> std::io::Result<(Session, Receiver<SessionEvent>)> {
+        Self::connect_with_sink(host, control_port, video_port, None)
+    }
+
+    /// `connect`, with video events offered to `sink` first.
+    pub fn connect_with_sink(
+        host: &str,
+        control_port: u16,
+        video_port: Option<u16>,
+        sink: Option<VideoSink>,
     ) -> std::io::Result<(Session, Receiver<SessionEvent>)> {
         let (tx, rx) = mpsc::channel();
 
@@ -157,7 +172,7 @@ impl Session {
                     threads.push(
                         thread::Builder::new()
                             .name("transom-video".into())
-                            .spawn(move || video_loop(read, tx))
+                            .spawn(move || video_loop(read, tx, sink))
                             .expect("spawn video thread"),
                     );
                     Some(stream)
@@ -325,16 +340,23 @@ fn read_hello(stream: &mut TcpStream) -> std::io::Result<ServerMessage> {
     }
 }
 
-fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>) {
+fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>, sink: Option<VideoSink>) {
+    let deliver = |event: VideoEvent| -> bool {
+        let event = match &sink {
+            Some(sink) => match sink(event) {
+                Some(event) => event,
+                None => return true,
+            },
+            None => event,
+        };
+        tx.send(SessionEvent::Video(event)).is_ok()
+    };
     let mut rx = FramedReceiver::new(stream);
     loop {
         match rx.recv() {
             Ok(Some(payload)) => match VideoMessage::decode(&payload) {
                 Ok(VideoMessage::Config { lane, hvcc }) => {
-                    if tx
-                        .send(SessionEvent::Video(VideoEvent::Config { lane, hvcc }))
-                        .is_err()
-                    {
+                    if !deliver(VideoEvent::Config { lane, hvcc }) {
                         return;
                     }
                 }
@@ -354,17 +376,14 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>) {
                         received: latency::now_micros(),
                         ..Default::default()
                     };
-                    if tx
-                        .send(SessionEvent::Video(VideoEvent::Frame {
-                            lane,
-                            seq,
-                            pts_micros,
-                            keyframe,
-                            stamps,
-                            data,
-                        }))
-                        .is_err()
-                    {
+                    if !deliver(VideoEvent::Frame {
+                        lane,
+                        seq,
+                        pts_micros,
+                        keyframe,
+                        stamps,
+                        data,
+                    }) {
                         return;
                     }
                 }

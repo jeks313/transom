@@ -3,7 +3,7 @@
 use crate::hevc::HevcConfig;
 use crate::latency::{self, FrameStamps};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use windows::core::Interface;
@@ -81,17 +81,57 @@ impl PendingInput {
     }
 }
 
+/// Called from the decode thread whenever a new frame is ready, so the UI
+/// thread presents it at once instead of on its next poll.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// The submitting side of a decoder. The video thread holds a clone, so a
+/// frame reaches the decoder as soon as it arrives, not when the UI thread
+/// next looks.
+#[derive(Clone)]
+pub struct DecoderInput {
+    input: Arc<(Mutex<PendingInput>, Condvar)>,
+    keyframe_request: Arc<AtomicBool>,
+    received: Arc<AtomicU64>,
+}
+impl DecoderInput {
+    pub fn submit(&self, data: Vec<u8>, keyframe: bool, pts_micros: u64, stamps: FrameStamps) {
+        let n = self.received.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 3 {
+            eprintln!("video: access unit {n} ({} bytes, keyframe={keyframe})", data.len());
+        }
+        let (lock, ready) = &*self.input;
+        let dropped_chain = lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(EncodedFrame {
+                data,
+                keyframe,
+                pts_micros,
+                reset: false,
+                stamps,
+            });
+        if dropped_chain {
+            self.keyframe_request.store(true, Ordering::Release);
+        }
+        ready.notify_one();
+    }
+    /// Access units submitted so far.
+    pub fn received(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
+    }
+}
+
 /// Preserve compressed dependencies in a bounded queue. Only decoded output
 /// may safely use a latest-frame mailbox.
 pub struct DecoderWorker {
-    input: Arc<(Mutex<PendingInput>, Condvar)>,
+    input: DecoderInput,
     output: Arc<Mutex<Option<DecodedFrame>>>,
     error: Arc<Mutex<Option<String>>>,
-    keyframe_request: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 impl DecoderWorker {
-    pub fn start(hvcc: Vec<u8>, width: u32, height: u32) -> std::io::Result<Self> {
+    pub fn start(hvcc: Vec<u8>, width: u32, height: u32, wake: Wake) -> std::io::Result<Self> {
         let input = Arc::new((
             Mutex::new(PendingInput {
                 awaiting_keyframe: true,
@@ -153,7 +193,8 @@ impl DecoderWorker {
                                     );
                                 }
                                 *worker_output.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some(frame)
+                                    Some(frame);
+                                wake();
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -176,29 +217,18 @@ impl DecoderWorker {
                 pending.bytes = 0;
             })?;
         Ok(Self {
-            input,
+            input: DecoderInput {
+                input,
+                keyframe_request,
+                received: Arc::new(AtomicU64::new(0)),
+            },
             output,
             error,
-            keyframe_request,
             thread: Some(thread),
         })
     }
-    pub fn submit(&self, data: Vec<u8>, keyframe: bool, pts_micros: u64, stamps: FrameStamps) {
-        let (lock, ready) = &*self.input;
-        let dropped_chain = lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(EncodedFrame {
-                data,
-                keyframe,
-                pts_micros,
-                reset: false,
-                stamps,
-            });
-        if dropped_chain {
-            self.keyframe_request.store(true, Ordering::Release);
-        }
-        ready.notify_one();
+    pub fn input(&self) -> &DecoderInput {
+        &self.input
     }
     pub fn take_frame(&self) -> Option<DecodedFrame> {
         self.output.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -207,12 +237,12 @@ impl DecoderWorker {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
     pub fn take_keyframe_request(&self) -> bool {
-        self.keyframe_request.swap(false, Ordering::AcqRel)
+        self.input.keyframe_request.swap(false, Ordering::AcqRel)
     }
 }
 impl Drop for DecoderWorker {
     fn drop(&mut self) {
-        let (lock, ready) = &*self.input;
+        let (lock, ready) = &*self.input.input;
         {
             let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             pending.stopped = true;
@@ -598,7 +628,7 @@ mod tests {
 
     #[test]
     fn worker_reports_invalid_config_without_waiting_for_video_frames() {
-        let worker = DecoderWorker::start(vec![1, 2], 128, 96).unwrap();
+        let worker = DecoderWorker::start(vec![1, 2], 128, 96, Arc::new(|| {})).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(error) = worker.take_error() {

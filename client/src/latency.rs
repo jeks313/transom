@@ -84,7 +84,13 @@ impl FrameStamps {
             (from != 0 && to != 0 && to >= from).then(|| (to - from) as f32 / 1000.0)
         }
         let sent = clock.to_client(self.sent).unwrap_or(0);
-        let composited = clock.to_client(self.composited).unwrap_or(0);
+        // ScreenCaptureKit stamps a frame with when it is due on screen, which
+        // can fall after it reaches us: the frame starts at the earlier stamp.
+        let start = match (self.composited, self.captured) {
+            (0, c) | (c, 0) => c,
+            (a, c) => a.min(c),
+        };
+        let start = clock.to_client(start).unwrap_or(0);
         let end = if self.presented != 0 { self.presented } else { self.received };
         [
             span(self.composited, self.captured),
@@ -94,7 +100,7 @@ impl FrameStamps {
             span(self.received, self.submitted),
             span(self.submitted, self.decoded),
             span(self.decoded, self.presented),
-            span(composited, end),
+            span(start, end),
         ]
     }
 }
@@ -183,6 +189,15 @@ mod tests {
         assert_eq!(s[6], None);
         // Not presented yet: the whole runs to receipt.
         assert_eq!(s[7], Some(7.5));
+        // Stamped as due on screen after the capture had it: the capture stage is
+        // unknown and the whole starts at the capture.
+        let late = FrameStamps {
+            composited: 1_002_000,
+            ..stamps
+        };
+        let s = late.stages(&clock);
+        assert_eq!(s[0], None);
+        assert_eq!(s[7], Some(6.5));
     }
 
     #[test]

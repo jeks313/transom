@@ -14,7 +14,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
@@ -39,13 +40,14 @@ use super::connect::{Action, Dashboard};
 use super::gpu::{Gpu, SourceTexture};
 use crate::connections::Connection;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 type ConnectResult = Result<(Connection, Session, Receiver<SessionEvent>), String>;
 use super::input;
 use super::menu::MenuBar;
 use super::proxy::Proxy;
 use crate::model::{ModelEvent, Window};
 use crate::latency::{self, FrameStamps, LatencyStats, STAGES};
-use crate::session::{Session, SessionEvent, VideoEvent};
+use crate::session::{Session, SessionEvent, VideoEvent, VideoSink};
 use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size, WindowKind};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -54,7 +56,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 #[cfg(windows)]
-use super::decode::DecoderWorker;
+use super::decode::{DecoderInput, DecoderWorker, Wake};
 
 struct NativeEvent {
     hwnd: HWND,
@@ -94,6 +96,10 @@ pub struct App {
     notice: Option<String>,
     video_notice: Option<String>,
     session: Option<Session>,
+    /// Each lane's decoder input, shared with the session's video thread.
+    video_inputs: Arc<Mutex<HashMap<u32, DecoderInput>>>,
+    /// Set by a decoder when a frame is ready; the message loop waits on it.
+    wake: WakeEvent,
     /// When stage latency was last logged, and the worst lane's median total.
     latency_reported: Instant,
     latency_ms: Option<f32>,
@@ -129,7 +135,6 @@ struct LaneVideo {
     /// Video-health counters. If access units keep arriving but none ever decode
     /// (the tell-tale of the in-box HEVC decoder rejecting the host's 4:4:4 10-bit
     /// stream), we warn once instead of silently showing the placeholder forever.
-    video_in: u64,
     video_decoded: u64,
     warned_no_decode: bool,
     /// Per-stage latency of presented frames, and the frame uploaded since the
@@ -137,6 +142,11 @@ struct LaneVideo {
     latency: LatencyStats,
     shown: Option<FrameStamps>,
 }
+
+/// The auto-reset event decoders set when a frame is ready, as a plain value
+/// so a decoder thread can hold it.
+#[derive(Clone, Copy)]
+struct WakeEvent(isize);
 
 /// Append stage-latency lines to `%LOCALAPPDATA%\Transom\latency.log`, kept
 /// under about a megabyte.
@@ -200,6 +210,12 @@ impl App {
             notice: None,
             video_notice: None,
             session: None,
+            video_inputs: Arc::new(Mutex::new(HashMap::new())),
+            wake: WakeEvent(
+                unsafe { CreateEventW(None, false, false, None) }
+                    .map(|h| h.0 as isize)
+                    .unwrap_or(0),
+            ),
             latency_reported: Instant::now(),
             latency_ms: None,
             rx: None,
@@ -238,6 +254,34 @@ impl App {
             .set_status(&format!("Connecting to {}…", connection.name), true);
         let (tx, rx) = mpsc::channel();
         self.connecting = Some(rx);
+        // Frames go straight from the video thread to their lane's decoder.
+        let inputs = Arc::new(Mutex::new(HashMap::<u32, DecoderInput>::new()));
+        self.video_inputs = inputs.clone();
+        let sink: VideoSink = Arc::new(move |event| {
+            let lane = match &event {
+                VideoEvent::Frame { lane, .. } => *lane,
+                _ => return Some(event),
+            };
+            let Some(input) = inputs.lock().ok().and_then(|m| m.get(&lane).cloned()) else {
+                return Some(event);
+            };
+            let VideoEvent::Frame {
+                keyframe,
+                pts_micros,
+                stamps,
+                data,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            let stamps = FrameStamps {
+                submitted: latency::now_micros(),
+                ..stamps
+            };
+            input.submit(data, keyframe, pts_micros, stamps);
+            None
+        });
         std::thread::spawn(move || {
             let result = (|| {
                 // Rediscover saved Bonjour identities before using an endpoint:
@@ -251,10 +295,11 @@ impl App {
                             "Mac is offline or not sharing. Open Transom Host and press Start.",
                         )?;
                 }
-                let (session, events) = Session::connect(
+                let (session, events) = Session::connect_with_sink(
                     &connection.host,
                     connection.control_port,
                     connection.video_port,
+                    Some(sink),
                 )
                 .map_err(|e| e.to_string())?;
                 Ok((connection, session, events))
@@ -348,6 +393,9 @@ impl App {
         }
         self.rx = None;
         self.lanes.clear();
+        if let Ok(mut inputs) = self.video_inputs.lock() {
+            inputs.clear();
+        }
         self.menus.clear();
         self.menus_stale.clear();
         self.menu_refreshed.clear();
@@ -462,6 +510,9 @@ impl App {
         match ev {
             ModelEvent::Connected { lanes } => {
                 self.lanes.clear();
+                if let Ok(mut inputs) = self.video_inputs.lock() {
+                    inputs.clear();
+                }
                 for lane in lanes {
                     self.lanes.insert(
                         lane.lane,
@@ -469,7 +520,6 @@ impl App {
                             vds: lane.vds,
                             source: None,
                             decoder: None,
-                            video_in: 0,
                             video_decoded: 0,
                             warned_no_decode: false,
                             latency: LatencyStats::default(),
@@ -581,8 +631,17 @@ impl App {
         match v {
             VideoEvent::Config { lane, hvcc } => {
                 if let Some(l) = self.lanes.get_mut(&lane) {
-                    match DecoderWorker::start(hvcc, l.vds.w, l.vds.h) {
-                        Ok(d) => l.decoder = Some(d),
+                    let wake = self.wake;
+                    let wake: Wake = Arc::new(move || unsafe {
+                        let _ = SetEvent(HANDLE(wake.0 as _));
+                    });
+                    match DecoderWorker::start(hvcc, l.vds.w, l.vds.h, wake) {
+                        Ok(d) => {
+                            if let Ok(mut inputs) = self.video_inputs.lock() {
+                                inputs.insert(lane, d.input().clone());
+                            }
+                            l.decoder = Some(d);
+                        }
                         Err(e) => {
                             self.video_notice = Some(format!("Cannot start video decoder: {e}"));
                             self.update_status();
@@ -590,6 +649,8 @@ impl App {
                     }
                 }
             }
+            // Frames reach a running decoder from the video thread (`connect`);
+            // only those that beat their decoder's start come through here.
             VideoEvent::Frame {
                 lane,
                 data,
@@ -598,39 +659,12 @@ impl App {
                 stamps,
                 ..
             } => {
-                let Some(l) = self.lanes.get_mut(&lane) else {
-                    return;
-                };
-                l.video_in += 1;
-                if l.video_in <= 3 {
-                    eprintln!(
-                        "video: lane {lane} access unit {} ({} bytes, keyframe={keyframe})",
-                        l.video_in,
-                        data.len()
-                    );
-                }
-                if let Some(decoder) = l.decoder.as_ref() {
+                if let Some(decoder) = self.lanes.get(&lane).and_then(|l| l.decoder.as_ref()) {
                     let stamps = FrameStamps {
                         submitted: latency::now_micros(),
                         ..stamps
                     };
-                    decoder.submit(data, keyframe, pts_micros, stamps);
-                }
-                // A newly connected client must wait for a complete keyframe.
-                // Preserve any more specific error reported by the worker.
-                if !l.warned_no_decode
-                    && self.notice.is_none()
-                    && self.video_notice.is_none()
-                    && l.video_decoded == 0
-                    && l.video_in >= 120
-                {
-                    l.warned_no_decode = true;
-                    let count = l.video_in;
-                    self.video_notice=Some("Video is arriving but no picture has decoded yet. Waiting for a complete keyframe…".into());
-                    self.update_status();
-                    eprintln!(
-                        "video: lane {lane} received {count} access units; waiting for a decodable keyframe"
-                    );
+                    decoder.input().submit(data, keyframe, pts_micros, stamps);
                 }
             }
         }
@@ -658,6 +692,25 @@ impl App {
             .unwrap_or(false);
         let error = lane.decoder.as_ref().and_then(DecoderWorker::take_error);
         let frame = lane.decoder.as_ref().and_then(DecoderWorker::take_frame);
+        let received = lane.decoder.as_ref().map_or(0, |d| d.input().received());
+        // A newly connected client must wait for a complete keyframe.
+        // Preserve any more specific error reported by the worker.
+        if !lane.warned_no_decode
+            && frame.is_none()
+            && self.notice.is_none()
+            && self.video_notice.is_none()
+            && lane.video_decoded == 0
+            && received >= 120
+        {
+            if let Some(l) = self.lanes.get_mut(&id) {
+                l.warned_no_decode = true;
+            }
+            self.video_notice = Some("Video is arriving but no picture has decoded yet. Waiting for a complete keyframe…".into());
+            self.update_status();
+            eprintln!(
+                "video: lane {id} received {received} access units; waiting for a decodable keyframe"
+            );
+        }
         if needs_keyframe {
             self.send(&ClientMessage::RequestKeyframe { lane: Some(id) });
             self.video_notice = Some("Video fell behind; recovering…".into());
@@ -963,13 +1016,11 @@ impl App {
         let now = latency::now_micros();
         for lane in self.lanes.values_mut() {
             if let Some(stamps) = lane.shown.take() {
-                lane.latency.record(
-                    &FrameStamps {
-                        presented: now,
-                        ..stamps
-                    },
-                    &clock,
-                );
+                let stamps = FrameStamps {
+                    presented: now,
+                    ..stamps
+                };
+                lane.latency.record(&stamps, &clock);
             }
         }
         if self.latency_reported.elapsed() < Duration::from_secs(5) {
@@ -1461,7 +1512,10 @@ pub fn run_pump(mut app: Box<App>) {
                 // Still connected, just no windows yet — keep waiting.
             }
             // Wake on new input, or after ~8ms to re-poll the session channel.
-            MsgWaitForMultipleObjectsEx(None, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            // A decoded frame wakes the loop at once, so it is presented now.
+            let wake = [HANDLE((*app_ptr).wake.0 as _)];
+            let handles = if wake[0].0.is_null() { None } else { Some(&wake[..]) };
+            MsgWaitForMultipleObjectsEx(handles, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         }
     }
 
