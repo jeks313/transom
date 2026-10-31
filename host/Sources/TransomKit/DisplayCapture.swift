@@ -41,6 +41,8 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     // Accessed only on the capture queue, including explicit refreshes.
     private var lastPixelPTS = CMTime.invalid
     private var lastEmission = DispatchTime.now().uptimeNanoseconds
+    /// Whether the newest emission was a captured frame, not a refresh of one.
+    private var lastWasCapture = false
 
     private let lock = NSLock()
     private var stream: SCStream?
@@ -223,12 +225,14 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
     }
 
     /// SCK stops producing complete samples when the screen settles. A decoder
-    /// can still hold the final frame, or be waiting for a recovery keyframe.
-    /// Keep idle sessions advancing without increasing an active stream's FPS.
+    /// can still hold the final frame, or be waiting for a recovery keyframe, so
+    /// once the screen has been still for 100 ms the last frame is sent once more.
+    /// Only once: every refresh occupies the one hardware encoder (a 5K frame
+    /// takes ~23 ms), and a real frame arriving behind one waits for it.
     public func requestIdleRefresh() {
         queue.async { [weak self] in
-            guard let self,
-                DispatchTime.now().uptimeNanoseconds - self.lastEmission >= 250_000_000
+            guard let self, self.lastWasCapture,
+                DispatchTime.now().uptimeNanoseconds - self.lastEmission >= 100_000_000
             else { return }
             self.refreshOnCaptureQueue()
         }
@@ -238,6 +242,7 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
         let buffer = lock.withLock { stream == nil ? nil : latestPixelBuffer }
         guard let buffer else { return }
         emitPixelBuffer(buffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+        lastWasCapture = false
     }
 
     private func emitPixelBuffer(_ buffer: CVPixelBuffer, pts: CMTime) {
@@ -317,6 +322,7 @@ public final class DisplayCapture: NSObject, SCStreamOutput, @unchecked Sendable
         // encoder before spending anything on the CGImage path (I-1). Signposted
         // so the capture→handoff interval is measurable in Instruments.
         emitPixelBuffer(pixelBuffer, pts: sampleBuffer.presentationTimeStamp)
+        lastWasCapture = true
 
         if let frameHook {
             let image = ctx.createCGImage(

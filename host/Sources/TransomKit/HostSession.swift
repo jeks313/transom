@@ -437,9 +437,10 @@ public final class HostSession: @unchecked Sendable {
                     case let .requestKeyframe(laneID):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
-                        // chain at the next encoded frame.
+                        // chain at once: a still screen sends no next frame.
                         for lane in lanes where laneID == nil || lane.id == laneID {
                             lane.encoder?.requestKeyframe()
+                            lane.capture?.requestRefresh()
                         }
                     }
                 }
@@ -696,7 +697,11 @@ public final class HostSession: @unchecked Sendable {
                 config: HEVCEncoder.Config(
                     width: disp.pixelWidth, height: disp.pixelHeight, fps: config.fps,
                     bitrateBitsPerSecond: config.bitrateMbps * 1_000_000,
-                    maxKeyFrameInterval: config.fps * 2, format: config.videoFormat))
+                    // A keyframe of a 5K lane is ~250KB: one every 2s cost a
+                    // latency spike each time. The stream is reliable and the
+                    // client asks for one when it needs it, so this is only a
+                    // backstop.
+                    maxKeyFrameInterval: config.fps * 60, format: config.videoFormat))
             enc.extractFrameData = true
             lane.encoder = enc
             lane.capture = DisplayCapture(display: disp, fps: config.fps,
@@ -759,7 +764,7 @@ public final class HostSession: @unchecked Sendable {
         let captures = lanes.compactMap(\.capture)
         tasks.append(Task {
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(300)) }
+                do { try await Task.sleep(for: .milliseconds(50)) }
                 catch { break }
                 if await videoServer.hasClient {
                     for cap in captures { cap.requestIdleRefresh() }
