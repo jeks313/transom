@@ -46,7 +46,7 @@ use super::input;
 use super::menu::MenuBar;
 use super::proxy::Proxy;
 use crate::model::{ModelEvent, Window};
-use crate::latency::{self, FrameStamps, LatencyStats, STAGES};
+use crate::latency::{self, FrameStamps, InputProbe, LatencyStats, STAGES};
 use crate::session::{Session, SessionEvent, VideoEvent, VideoSink};
 use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size, WindowKind};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
@@ -103,6 +103,8 @@ pub struct App {
     /// Per-stage latency of every presented frame, when it was last logged,
     /// and its median total.
     latency: LatencyStats,
+    /// Keys and clicks sent, matched to the frames that answer them.
+    input_probe: std::cell::RefCell<InputProbe>,
     latency_reported: Instant,
     latency_ms: Option<f32>,
     rx: Option<std::sync::mpsc::Receiver<SessionEvent>>,
@@ -212,6 +214,7 @@ impl App {
                     .unwrap_or(0),
             ),
             latency: LatencyStats::default(),
+            input_probe: Default::default(),
             latency_reported: Instant::now(),
             latency_ms: None,
             rx: None,
@@ -512,6 +515,7 @@ impl App {
                     inputs.clear();
                 }
                 self.latency = LatencyStats::default();
+                self.input_probe = Default::default();
             }
             ModelEvent::WindowAdded(w) => {
                 // A sheet (a system prompt the host moved onto its prompt
@@ -1027,13 +1031,14 @@ impl App {
         };
         let Ok(clock) = clock.lock() else { return };
         let now = latency::now_micros();
-        for stream in self.streams.values_mut() {
+        for (id, stream) in self.streams.iter_mut() {
             if let Some(stamps) = stream.shown.take() {
                 let stamps = FrameStamps {
                     presented: now,
                     ..stamps
                 };
                 self.latency.record(&stamps, &clock);
+                self.input_probe.borrow_mut().on_frame(*id, &stamps, &clock);
             }
         }
         if self.latency_reported.elapsed() < Duration::from_secs(5) {
@@ -1047,6 +1052,9 @@ impl App {
         let total = self.latency.percentile(STAGES.len() - 1, 0.5);
         if total.is_some() {
             lines.push(format!("windows: {}", self.latency.summary()));
+        }
+        if let Some(summary) = self.input_probe.borrow().summary() {
+            lines.push(format!("input: {summary}"));
         }
         drop(clock);
         if total.is_none() {
@@ -1337,6 +1345,9 @@ impl App {
     }
 
     fn send_input(&self, id: u64, event: InputEvent) {
+        if matches!(event, InputEvent::KeyDown { .. } | InputEvent::MouseDown { .. }) {
+            self.input_probe.borrow_mut().on_input(id, latency::now_micros());
+        }
         self.send(&ClientMessage::Input {
             id,
             event,

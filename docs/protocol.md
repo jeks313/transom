@@ -442,6 +442,14 @@ host clock (§4 clock sync). The client stamps arrival, decode and present on it
 own clock and reports each stage (`latency.log` in `%LOCALAPPDATA%\Transom`, and
 `connect --video` prints them).
 
+**Input to screen** is measured by the client alone: a key or click sent to a
+window is answered by that window's first frame captured after the input could
+have reached the Mac (half the fastest round trip), split into input to capture
+and input to screen. The host does not say which frame answers which input, so
+a caret blink or animation landing first reads early; a window that changes only
+when typed into reads true. `connect --video --type <keys> --type-every <ms>`
+types into a window to measure it.
+
 **Each window is its own stream (v4)**: its own encoder at its own size, config,
 keyframe gate and `seq`; the client keeps one decoder and one texture per window.
 The Mac has one hardware HEVC encoder whose time is set by pixel count (about

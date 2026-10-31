@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use crate::latency::LatencyStats;
+use crate::latency::{self, InputProbe, LatencyStats};
 use crate::model::ModelEvent;
 use crate::session::{Session, SessionEvent, VideoEvent};
 use crate::vk;
@@ -30,6 +30,9 @@ struct Options {
     video_port: Option<u16>,
     seconds: Option<f64>,
     type_text: Option<String>,
+    /// Type `type_text` one key every this many ms, over and over, measuring
+    /// input to screen; instead of all at once.
+    type_every: Option<u64>,
     click: Option<(u64, u32, u32)>,
     resize: Option<(u64, u32, u32)>,
     /// Window id, menu path and the item's title.
@@ -90,6 +93,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut latency: HashMap<u64, LatencyStats> = HashMap::new();
     let mut video_bytes = 0u64;
     let mut last_video_report = Instant::now();
+    let mut probe = InputProbe::default();
+    let mut next_key = opts.type_every.map(|_| Instant::now() + Duration::from_secs(2));
+    let mut key_index = 0usize;
 
     let deadline = opts.seconds.map(|s| started + Duration::from_secs_f64(s));
 
@@ -101,7 +107,24 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
 
-        let event = match rx.recv_timeout(Duration::from_millis(200)) {
+        if let (Some(at), Some(every), Some(text)) = (next_key, opts.type_every, &opts.type_text) {
+            let target = opts.window.or_else(|| order.first().copied());
+            if let (true, Some(id)) = (Instant::now() >= at, target) {
+                let chars: Vec<char> = text.chars().collect();
+                if !chars.is_empty() {
+                    let c = chars[key_index % chars.len()].to_string();
+                    key_index += 1;
+                    probe.on_input(id, latency::now_micros());
+                    send_text(&session, id, &c, now_ms());
+                }
+                next_key = Some(at + Duration::from_millis(every));
+            }
+        }
+        let wait = next_key
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_millis(200))
+            .min(Duration::from_millis(200));
+        let event = match rx.recv_timeout(wait) {
             Ok(ev) => ev,
             Err(RecvTimeoutError::Timeout) => {
                 maybe_run_actions(
@@ -150,6 +173,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 video_bytes += data.len() as u64;
                 if let Ok(c) = clock.lock() {
                     latency.entry(stream).or_default().record(&stamps, &c);
+                    probe.on_frame(stream, &stamps, &c);
                 }
                 // Rate-limit the video log to once a second so it doesn't drown the
                 // control-plane trace.
@@ -172,6 +196,9 @@ pub fn run(args: &[String]) -> ExitCode {
                     streams.sort_by_key(|(id, _)| **id);
                     for (id, stats) in streams {
                         println!("           window {id}: {}", stats.summary());
+                    }
+                    if let Some(summary) = probe.summary() {
+                        println!("           input: {summary}");
                     }
                     video_bytes = 0;
                     last_video_report = Instant::now();
@@ -323,7 +350,7 @@ fn maybe_run_actions(
         send_click(session, id, x, y, ts);
     }
 
-    if let Some(text) = &opts.type_text {
+    if let (Some(text), None) = (&opts.type_text, opts.type_every) {
         send_text(session, target, text, ts);
     }
 
@@ -413,6 +440,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut video_port: Option<u16> = None;
     let mut seconds: Option<f64> = None;
     let mut type_text: Option<String> = None;
+    let mut type_every: Option<u64> = None;
     let mut click: Option<(u64, u32, u32)> = None;
     let mut resize: Option<(u64, u32, u32)> = None;
     let mut menu_pick: Option<(u64, Vec<u32>, String)> = None;
@@ -445,6 +473,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--type" => {
                 type_text = Some(take(args, &mut i, "--type")?);
+            }
+            "--type-every" => {
+                type_every = Some(
+                    take(args, &mut i, "--type-every")?
+                        .parse()
+                        .map_err(|_| "invalid --type-every".to_string())?,
+                );
             }
             "--click" => {
                 click = Some(parse_triple(&take(args, &mut i, "--click")?, "--click")?);
@@ -483,6 +518,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         video_port,
         seconds,
         type_text,
+        type_every,
         click,
         resize,
         menu_pick,
@@ -526,6 +562,7 @@ pub fn print_usage() {
          --video-port <n>     also open the video channel on <n>\n    \
          --seconds <n>        run for n seconds then disconnect (default: until Ctrl-C)\n    \
          --type <text>        focus the first window and type <text> (US/ANSI keys)\n    \
+         --type-every <ms>    type --type one key every <ms>, measuring input to screen\n    \
          --click <id:x:y>     left-click window <id> at window-local pixel (x,y)\n    \
          --resize <id:w:h>    request a begin/live/end resize of window <id> to w x h\n\
          --menu-pick <id:path=title>  choose a menu item of window <id>'s app\n\
