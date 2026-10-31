@@ -52,6 +52,7 @@ struct WireProtocolTests {
                         ])
                 ]),
             .pong(clientMicros: 123_456_789, hostMicros: 987_654_321),
+            .clipboard(text: "copied \u{1F600}\nline two"),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)
@@ -76,6 +77,7 @@ struct WireProtocolTests {
             .menuPick(id: 7, path: [2, 0], title: "New Window"),
             .menuRefresh(id: 7),
             .ping(clientMicros: 123_456_789),
+            .clipboard(text: "pasted"),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)

@@ -151,6 +151,10 @@ pub enum ServerMessage {
         client_micros: u64,
         host_micros: u64,
     },
+    /// Text copied on the Mac, for our clipboard.
+    Clipboard {
+        text: String,
+    },
 }
 
 /// Client → host. What we're allowed to ask the host to do.
@@ -194,6 +198,10 @@ pub enum ClientMessage {
     /// A clock probe; the host answers at once with `Pong`.
     Ping {
         client_micros: u64,
+    },
+    /// Text copied here, for the Mac's pasteboard.
+    Clipboard {
+        text: String,
     },
 }
 
@@ -378,6 +386,9 @@ impl ServerMessage {
                 client_micros: u64_field(&v, "clientMicros")?,
                 host_micros: u64_field(&v, "hostMicros")?,
             }),
+            "clipboard" => Ok(ServerMessage::Clipboard {
+                text: str_field(&v, "text")?,
+            }),
             other => Err(DecodeError::Shape(format!(
                 "unknown control message type `{other}`"
             ))),
@@ -438,6 +449,10 @@ impl ClientMessage {
             ClientMessage::Ping { client_micros } => Value::object(vec![
                 ("type", Value::str("ping")),
                 ("clientMicros", Value::uint(*client_micros)),
+            ]),
+            ClientMessage::Clipboard { text } => Value::object(vec![
+                ("type", Value::str("clipboard")),
+                ("text", Value::str(text.clone())),
             ]),
         }
     }
@@ -675,6 +690,26 @@ mod tests {
                 .to_value()
                 .to_json(),
             r#"{"type":"requestKeyframe","id":2}"#
+        );
+    }
+
+    #[test]
+    fn clipboard_both_ways() {
+        let msg = ServerMessage::decode(br#"{"type":"clipboard","text":"a\nb \ud83d\ude00"}"#)
+            .unwrap();
+        assert_eq!(
+            msg,
+            ServerMessage::Clipboard {
+                text: "a\nb \u{1F600}".into()
+            }
+        );
+        assert_eq!(
+            ClientMessage::Clipboard {
+                text: "say \"hi\"".into()
+            }
+            .to_value()
+            .to_json(),
+            r#"{"type":"clipboard","text":"say \"hi\""}"#
         );
     }
 

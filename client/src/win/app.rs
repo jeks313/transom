@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSCOMMAND,
 };
 
+use super::clipboard::ClipboardSync;
 use super::connect::{Action, Dashboard};
 use super::gpu::{Gpu, SourceTexture};
 use crate::connections::Connection;
@@ -129,6 +130,7 @@ pub struct App {
     pending_mouse_moves: HashMap<u64, InputEvent>,
     reconnect_at: Option<Instant>,
     now_epoch: Instant,
+    clipboard: ClipboardSync,
 }
 
 /// One window's video: its size, the texture its proxy draws, its decoder.
@@ -243,6 +245,7 @@ impl App {
             pending_mouse_moves: HashMap::new(),
             reconnect_at: None,
             now_epoch: Instant::now(),
+            clipboard: ClipboardSync::new(),
         }
     }
 
@@ -449,6 +452,16 @@ impl App {
         }
     }
 
+    /// Send text copied here to the Mac.
+    fn poll_clipboard(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+        if let Some(text) = self.clipboard.poll(self.dashboard.hwnd, false) {
+            self.send(&ClientMessage::Clipboard { text });
+        }
+    }
+
     /// Send a message to the host, if connected.
     fn send(&self, msg: &ClientMessage) {
         if let Some(s) = &self.session {
@@ -528,6 +541,10 @@ impl App {
                 }
                 self.latency = LatencyStats::default();
                 self.input_probe = Default::default();
+                // What was copied here while away is what a paste on the Mac wants.
+                if let Some(text) = self.clipboard.poll(self.dashboard.hwnd, true) {
+                    self.send(&ClientMessage::Clipboard { text });
+                }
             }
             ModelEvent::WindowAdded(w) => {
                 // A sheet (a system prompt the host moved onto its prompt
@@ -568,6 +585,7 @@ impl App {
             ModelEvent::HostError { code, message } => {
                 self.notice = Some(format!("Host error {code}: {message}"));
             }
+            ModelEvent::Clipboard { text } => self.clipboard.set(self.dashboard.hwnd, &text),
             ModelEvent::MenuBar { app, menus } => {
                 self.menus.insert(app, menus);
                 let ids: Vec<u64> = self
@@ -1598,6 +1616,7 @@ fn tick(app_ptr: *mut App) {
         (*app_ptr).drain_session(app_ptr);
         (*app_ptr).poll_decoder();
         (*app_ptr).flush_mouse_moves();
+        (*app_ptr).poll_clipboard();
         (*app_ptr).render_all();
         (*app_ptr).record_presented();
     }

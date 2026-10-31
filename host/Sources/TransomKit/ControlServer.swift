@@ -112,6 +112,11 @@ public actor ControlServer {
         await send(.menuBar(app: app, menus: menus))
     }
 
+    /// Send text copied on the Mac to the connected client, if any.
+    public func sendClipboard(_ text: String) async {
+        await send(.clipboard(text: text))
+    }
+
     /// The opaque app token of a window: its owner's process id.
     static func app(of id: UInt64, in registry: WindowRegistry) -> UInt32 {
         guard let element = registry.element(for: id) else { return 0 }

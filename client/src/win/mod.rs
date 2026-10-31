@@ -12,6 +12,7 @@
 //! protocol half is trustworthy and this half is the native shell around it.
 
 mod app;
+mod clipboard;
 mod connect;
 mod decode;
 mod dpi;

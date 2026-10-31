@@ -39,6 +39,8 @@ struct Options {
     menu_pick: Option<(u64, Vec<u32>, String)>,
     /// The window --type types into; the first window when unset.
     window: Option<u64>,
+    /// Text to put on the Mac's pasteboard once connected.
+    copy: Option<String>,
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -75,6 +77,10 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let started = Instant::now();
     let now_ms = || started.elapsed().as_millis() as u64;
+    if let Some(text) = &opts.copy {
+        let _ = session.send(&ClientMessage::Clipboard { text: text.clone() });
+        println!("[{:>6}ms] -> clipboard {} bytes", now_ms(), text.len());
+    }
 
     // Local mirror of the window set, so we can pick a default target for
     // --type/--click/--resize and print titles.
@@ -308,6 +314,7 @@ fn print_control(ev: &ModelEvent, t: u64) {
         ModelEvent::HostError { code, message } => {
             println!("[{t:>6}ms] ! host error {code}: {message}")
         }
+        ModelEvent::Clipboard { text } => println!("[{t:>6}ms] clipboard {text:?}"),
         ModelEvent::MenuBar { app, menus } => {
             let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
             println!(
@@ -445,6 +452,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut resize: Option<(u64, u32, u32)> = None;
     let mut menu_pick: Option<(u64, Vec<u32>, String)> = None;
     let mut window: Option<u64> = None;
+    let mut copy: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -473,6 +481,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             "--type" => {
                 type_text = Some(take(args, &mut i, "--type")?);
+            }
+            "--copy" => {
+                copy = Some(take(args, &mut i, "--copy")?);
             }
             "--type-every" => {
                 type_every = Some(
@@ -523,6 +534,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         resize,
         menu_pick,
         window,
+        copy,
     })
 }
 
@@ -567,6 +579,7 @@ pub fn print_usage() {
          --resize <id:w:h>    request a begin/live/end resize of window <id> to w x h\n\
          --menu-pick <id:path=title>  choose a menu item of window <id>'s app\n\
          --window <id>        the window --type types into (default: the first)\n\
+         --copy <text>        put <text> on the Mac's clipboard\n\
          \n\
          EXAMPLE:\n    \
          transom-client connect 127.0.0.1 --control-port 47100 --seconds 5 --type hello"

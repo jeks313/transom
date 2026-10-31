@@ -214,6 +214,7 @@ public final class HostSession: @unchecked Sendable {
     private var videoListener: TCPListener?
     private var controlServer: ControlServer?
     private var videoServer: VideoServer?
+    private let pasteboard = PasteboardSync()
     /// Keeps App Nap off while sharing. Napped, the host's encodes took 17 ms
     /// for a window the encoder does in 8 (measured 2026-10-30): the throttling
     /// started about a minute after launch.
@@ -412,6 +413,7 @@ public final class HostSession: @unchecked Sendable {
         self.watcherRunLoop = ctx.runLoop
 
         tasks.append(Task { await controlServer.serve(listener: controlListener) })
+        pasteboard.start { text in Task { await controlServer.sendClipboard(text) } }
         tasks.append(
             Task {
                 for await item in events { await controlServer.broadcast(item.event, lane: item.lane) }
@@ -440,6 +442,8 @@ public final class HostSession: @unchecked Sendable {
                         self?.readMenus(pid: pid_t(bitPattern: ControlServer.app(of: id, in: lane.registry)))
                     case .ping:
                         break  // answered by the control server
+                    case let .clipboard(text):
+                        self?.pasteboard.set(text)
                     case let .requestKeyframe(id):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
@@ -781,6 +785,7 @@ public final class HostSession: @unchecked Sendable {
             ProcessInfo.processInfo.endActivity(activity)
             self.activity = nil
         }
+        pasteboard.stop()
         controlListener?.stop()
         videoListener?.stop()
         await controlServer?.stop()

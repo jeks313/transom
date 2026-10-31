@@ -112,6 +112,8 @@ public enum ControlMessage: Sendable, Equatable {
     /// The reply to `ping`: the client's stamp back, and the host clock when the
     /// ping was read, so the client can map host stamps onto its own clock.
     case pong(clientMicros: UInt64, hostMicros: UInt64)
+    /// Text copied on the Mac, for the client's clipboard.
+    case clipboard(text: String)
 }
 
 // MARK: - Client -> Host
@@ -135,6 +137,8 @@ public enum ClientMessage: Sendable, Equatable {
     case menuRefresh(id: UInt64)
     /// A clock probe, answered at once with `pong` (`clientMicros` is opaque).
     case ping(clientMicros: UInt64)
+    /// Text copied on the client, for the Mac's pasteboard.
+    case clipboard(text: String)
 }
 
 // MARK: - Codable (explicit, cross-language JSON)
@@ -143,7 +147,7 @@ extension ControlMessage: Codable {
     private enum Key: String, CodingKey {
         case type, id, lane, app, rect, title, kind, windows, displaySize
         case protocolVersion = "protocol"
-        case lanes, code, message, menus, clientMicros, hostMicros
+        case lanes, code, message, menus, clientMicros, hostMicros, text
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -192,6 +196,9 @@ extension ControlMessage: Codable {
             try c.encode("pong", forKey: .type)
             try c.encode(clientMicros, forKey: .clientMicros)
             try c.encode(hostMicros, forKey: .hostMicros)
+        case .clipboard(let text):
+            try c.encode("clipboard", forKey: .type)
+            try c.encode(text, forKey: .text)
         }
     }
 
@@ -240,6 +247,8 @@ extension ControlMessage: Codable {
             self = .pong(
                 clientMicros: try c.decode(UInt64.self, forKey: .clientMicros),
                 hostMicros: try c.decode(UInt64.self, forKey: .hostMicros))
+        case "clipboard":
+            self = .clipboard(text: try c.decode(String.self, forKey: .text))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ControlMessage type \"\(type)\"")
@@ -249,7 +258,7 @@ extension ControlMessage: Codable {
 
 extension ClientMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, lane, size, phase, event, ts, path, title, clientMicros
+        case type, id, lane, size, phase, event, ts, path, title, clientMicros, text
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -285,6 +294,9 @@ extension ClientMessage: Codable {
         case .ping(let clientMicros):
             try c.encode("ping", forKey: .type)
             try c.encode(clientMicros, forKey: .clientMicros)
+        case .clipboard(let text):
+            try c.encode("clipboard", forKey: .type)
+            try c.encode(text, forKey: .text)
         }
     }
 
@@ -317,6 +329,8 @@ extension ClientMessage: Codable {
             self = .menuRefresh(id: try c.decode(UInt64.self, forKey: .id))
         case "ping":
             self = .ping(clientMicros: try c.decode(UInt64.self, forKey: .clientMicros))
+        case "clipboard":
+            self = .clipboard(text: try c.decode(String.self, forKey: .text))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ClientMessage type \"\(type)\"")

@@ -570,10 +570,16 @@ Still deferred:
 - **Auth and encryption.** Assume a trusted wired LAN. Do not ship this over the
   internet. The host refuses to bind to a non-private address as a guardrail, not
   a security boundary.
-- **Clipboard.** Wanted eventually, not now.
 - **Audio.** Later, if ever.
 - **Multiple hosts or clients.** One to one; the host serves one client at a time.
   Several apps on separate displays share it as lanes (§1).
+
+Clipboard is **implemented**, plain text only: `{"type":"clipboard","text":...}`
+goes both ways on the control channel. The host checks the Mac pasteboard every
+250 ms and sends text copied there; the client sends what is copied on Windows,
+and its whole clipboard once on connect. Neither side sends back text it just
+wrote or received, and text over 1 MiB is not synced. The client turns `\n` into
+`\r\n` and back.
 
 Reconnect and state resync are **implemented** (§4): the host keeps running when
 the client drops, and a reconnecting client gets a full resync.

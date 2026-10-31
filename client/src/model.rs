@@ -72,6 +72,10 @@ pub enum ModelEvent {
         app: u32,
         menus: Vec<MenuItem>,
     },
+    /// Text copied on the Mac.
+    Clipboard {
+        text: String,
+    },
     /// The host sent an `error`. Surfaced for logging; not fatal on its own.
     HostError {
         code: u32,
@@ -274,6 +278,7 @@ impl WindowModel {
             ServerMessage::MenuBar { app, menus } => vec![ModelEvent::MenuBar { app, menus }],
             // Clock probes are the session's business, not the model's.
             ServerMessage::Pong { .. } => vec![],
+            ServerMessage::Clipboard { text } => vec![ModelEvent::Clipboard { text }],
         }
     }
 }
