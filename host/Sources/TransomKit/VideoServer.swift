@@ -100,6 +100,9 @@ public actor VideoServer {
             try await active.transport.send(
                 VideoWire.encodeFrame(
                     lane: lane, seq: state.seq, ptsMicros: ptsMicros, keyframe: frame.isKeyframe,
+                    timing: VideoWire.FrameTiming(
+                        capturedMicros: frame.capturedMicros, encodedMicros: frame.encodedMicros,
+                        sentMicros: HostClock.micros()),
                     data: frame.data))
             state.seq += 1
             // A reconnect during the awaits above reset the states; keep the reset.

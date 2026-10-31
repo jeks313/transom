@@ -169,6 +169,10 @@ public actor ControlServer {
                     Log.general.notice("control: undecodable client frame ignored")
                     continue
                 }
+                if case .ping(let clientMicros) = message {
+                    await send(.pong(clientMicros: clientMicros, hostMicros: HostClock.micros()))
+                    continue
+                }
                 onClientMessage?(message)
             }
         } catch {

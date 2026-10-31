@@ -1,6 +1,7 @@
 //! HEVC decoding on an MTA worker. Convert the wire's hvcC/length-prefixed
 //! samples to Annex B here, without changing the network protocol.
 use crate::hevc::HevcConfig;
+use crate::latency::{self, FrameStamps};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,6 +25,8 @@ const MAX_PENDING_BYTES: usize = 16 * 1024 * 1024;
 pub struct DecodedFrame {
     pub nv12: Vec<u8>,
     pub stride: usize,
+    /// The frame's journey so far, `decoded` stamped.
+    pub stamps: FrameStamps,
 }
 
 #[derive(Default)]
@@ -38,6 +41,7 @@ struct EncodedFrame {
     keyframe: bool,
     pts_micros: u64,
     reset: bool,
+    stamps: FrameStamps,
 }
 impl PendingInput {
     /// Queue one compressed access unit. Returns true when the dependency chain
@@ -136,7 +140,11 @@ impl DecoderWorker {
                             recover = false;
                         }
                         match decoder.decode(&encoded.data, encoded.keyframe, encoded.pts_micros) {
-                            Ok(Some(frame)) => {
+                            Ok(Some(mut frame)) => {
+                                frame.stamps = FrameStamps {
+                                    decoded: latency::now_micros(),
+                                    ..encoded.stamps
+                                };
                                 decoded += 1;
                                 if decoded == 1 {
                                     eprintln!(
@@ -175,7 +183,7 @@ impl DecoderWorker {
             thread: Some(thread),
         })
     }
-    pub fn submit(&self, data: Vec<u8>, keyframe: bool, pts_micros: u64) {
+    pub fn submit(&self, data: Vec<u8>, keyframe: bool, pts_micros: u64, stamps: FrameStamps) {
         let (lock, ready) = &*self.input;
         let dropped_chain = lock
             .lock()
@@ -185,6 +193,7 @@ impl DecoderWorker {
                 keyframe,
                 pts_micros,
                 reset: false,
+                stamps,
             });
         if dropped_chain {
             self.keyframe_request.store(true, Ordering::Release);
@@ -545,7 +554,11 @@ fn validate_nv12(
     if nv12.len() < needed {
         return Err("Invalid NV12 output buffer size".into());
     }
-    Ok(DecodedFrame { nv12, stride })
+    Ok(DecodedFrame {
+        nv12,
+        stride,
+        stamps: FrameStamps::default(),
+    })
 }
 
 /// BT.709 limited-range NV12, respecting padded rows without resizing.
@@ -617,6 +630,7 @@ mod tests {
             keyframe,
             pts_micros: n,
             reset: false,
+            stamps: FrameStamps::default(),
         }
     }
     #[test]
@@ -648,10 +662,21 @@ mod tests {
         let _com = ComApartment::new().unwrap();
         let data = include_bytes!("../../tests/fixtures/hevc-main.wire");
         let mut wire = FramedReceiver::new(&data[..]);
-        // The fixture was recorded in v1 framing, with no lane after the tag.
-        let v2 = |p: Vec<u8>| [vec![p[0], 0, 0, 0, 0], p[1..].to_vec()].concat();
+        // The fixture was recorded in v1 framing: no lane after the tag, and a
+        // frame has no stage stamps after its flags (v3).
+        let v3 = |p: Vec<u8>| {
+            let mut out = vec![p[0], 0, 0, 0, 0];
+            if p[0] == 0x02 {
+                out.extend_from_slice(&p[1..18]);
+                out.extend_from_slice(&[0; 24]);
+                out.extend_from_slice(&p[18..]);
+            } else {
+                out.extend_from_slice(&p[1..]);
+            }
+            out
+        };
         let VideoMessage::Config { hvcc, .. } =
-            VideoMessage::decode(&v2(wire.recv().unwrap().unwrap())).unwrap()
+            VideoMessage::decode(&v3(wire.recv().unwrap().unwrap())).unwrap()
         else {
             panic!("config expected")
         };
@@ -663,7 +688,7 @@ mod tests {
                 keyframe,
                 pts_micros,
                 ..
-            } = VideoMessage::decode(&v2(payload)).unwrap()
+            } = VideoMessage::decode(&v3(payload)).unwrap()
             else {
                 panic!("frame expected")
             };

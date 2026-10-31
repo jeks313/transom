@@ -50,6 +50,10 @@ public final class HEVCEncoder: @unchecked Sendable {
         public let pts: CMTime
         public let isKeyframe: Bool
         public let data: Data
+        /// `HostClock` when the capture handed the frame over, and when the
+        /// encoder returned it.
+        public var capturedMicros: UInt64 = 0
+        public var encodedMicros: UInt64 = 0
     }
 
     /// The chroma / bit-depth the stream is encoded at. The default is the mode
@@ -333,7 +337,9 @@ public final class HEVCEncoder: @unchecked Sendable {
     /// already supplies the encoder's native NV12 format, so this path skips a
     /// full-frame BGRA→NV12 transfer. The 4:4:4 mode keeps the media-engine
     /// conversion path.
-    public func encode(_ source: CVPixelBuffer, pts: CMTime, duration: CMTime) throws {
+    public func encode(
+        _ source: CVPixelBuffer, pts: CMTime, duration: CMTime, capturedMicros: UInt64 = 0
+    ) throws {
         let state = Log.signposter.beginInterval("encode")
         defer { Log.signposter.endInterval("encode", state) }
 
@@ -368,7 +374,7 @@ public final class HEVCEncoder: @unchecked Sendable {
 
         let handler: VTCompressionOutputHandler = { [weak self] status, _, sampleBuffer in
             guard let self, status == noErr, let sampleBuffer else { return }
-            self.emit(sampleBuffer)
+            self.emit(sampleBuffer, capturedMicros: capturedMicros)
         }
         let forceKeyframe = keyframeLock.withLock {
             let requested = forceNextKeyframe
@@ -391,7 +397,8 @@ public final class HEVCEncoder: @unchecked Sendable {
         }
     }
 
-    private func emit(_ sampleBuffer: CMSampleBuffer) {
+    private func emit(_ sampleBuffer: CMSampleBuffer, capturedMicros: UInt64) {
+        let encodedMicros = HostClock.micros()
         let byteCount = CMSampleBufferGetTotalSampleSize(sampleBuffer)
         guard byteCount > 0 else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -416,7 +423,9 @@ public final class HEVCEncoder: @unchecked Sendable {
 
         let data = extractFrameData ? Self.copyBytes(from: sampleBuffer) : Data()
         onEncodedFrame?(
-            EncodedFrame(byteCount: byteCount, pts: pts, isKeyframe: isKeyframe, data: data))
+            EncodedFrame(
+                byteCount: byteCount, pts: pts, isKeyframe: isKeyframe, data: data,
+                capturedMicros: capturedMicros, encodedMicros: encodedMicros))
     }
 
     /// Copy the contiguous encoded bytes out of a sample buffer for the wire.

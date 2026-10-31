@@ -272,6 +272,8 @@ impl WindowModel {
                 vec![ModelEvent::HostError { code, message }]
             }
             ServerMessage::MenuBar { app, menus } => vec![ModelEvent::MenuBar { app, menus }],
+            // Clock probes are the session's business, not the model's.
+            ServerMessage::Pong { .. } => vec![],
         }
     }
 }

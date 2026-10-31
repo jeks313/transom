@@ -146,6 +146,11 @@ pub enum ServerMessage {
         app: u32,
         menus: Vec<MenuItem>,
     },
+    /// The answer to `Ping`: our stamp back and the host clock when it read it.
+    Pong {
+        client_micros: u64,
+        host_micros: u64,
+    },
 }
 
 /// Client → host. What we're allowed to ask the host to do.
@@ -185,6 +190,10 @@ pub enum ClientMessage {
     /// A menu of window `id`'s app is opening: send its menu bar again.
     MenuRefresh {
         id: u64,
+    },
+    /// A clock probe; the host answers at once with `Pong`.
+    Ping {
+        client_micros: u64,
     },
 }
 
@@ -365,6 +374,10 @@ impl ServerMessage {
                 app: u32_field(&v, "app")?,
                 menus: menu_items(&v, "menus", 0)?,
             }),
+            "pong" => Ok(ServerMessage::Pong {
+                client_micros: u64_field(&v, "clientMicros")?,
+                host_micros: u64_field(&v, "hostMicros")?,
+            }),
             other => Err(DecodeError::Shape(format!(
                 "unknown control message type `{other}`"
             ))),
@@ -422,6 +435,10 @@ impl ClientMessage {
                 ("type", Value::str("menuRefresh")),
                 ("id", Value::uint(*id)),
             ]),
+            ClientMessage::Ping { client_micros } => Value::object(vec![
+                ("type", Value::str("ping")),
+                ("clientMicros", Value::uint(*client_micros)),
+            ]),
         }
     }
 
@@ -439,13 +456,13 @@ mod tests {
     #[test]
     fn decodes_hello() {
         let msg = ServerMessage::decode(
-            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
+            br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
         )
         .unwrap();
         assert_eq!(
             msg,
             ServerMessage::Hello {
-                protocol: 2,
+                protocol: 3,
                 lanes: vec![
                     Lane {
                         lane: 0,
@@ -659,5 +676,29 @@ mod tests {
                 .to_json(),
             r#"{"type":"requestKeyframe","lane":2}"#
         );
+    }
+
+    #[test]
+    fn decodes_pong_and_encodes_ping_as_the_host_does() {
+        let msg = ServerMessage::decode(
+            br#"{"type":"pong","clientMicros":1234567,"hostMicros":987654321012}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ServerMessage::Pong {
+                client_micros: 1_234_567,
+                host_micros: 987_654_321_012
+            }
+        );
+        let json = String::from_utf8(
+            ClientMessage::Ping {
+                client_micros: 42,
+            }
+            .encode(),
+        )
+        .unwrap();
+        assert!(json.contains(r#""type":"ping""#), "{json}");
+        assert!(json.contains(r#""clientMicros":42"#), "{json}");
     }
 }

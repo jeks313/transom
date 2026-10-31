@@ -51,6 +51,7 @@ struct WireProtocolTests {
                             MenuItem(title: "Close", enabled: false, checked: true),
                         ])
                 ]),
+            .pong(clientMicros: 123_456_789, hostMicros: 987_654_321),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)
@@ -74,6 +75,7 @@ struct WireProtocolTests {
             .input(id: 7, event: .keyUp(vk: 0x41), ts: 1005),
             .menuPick(id: 7, path: [2, 0], title: "New Window"),
             .menuRefresh(id: 7),
+            .ping(clientMicros: 123_456_789),
         ]
         for m in messages {
             #expect(try roundTrip(m) == m)
@@ -228,13 +230,17 @@ struct WireProtocolTests {
     @Test("video frame round-trips with its header")
     func videoFrameRoundTrips() {
         let payload = Data([0xAB, 0xCD, 0xEF])
+        let timing = VideoWire.FrameTiming(
+            capturedMicros: 9_876_600, encodedMicros: 9_880_000, sentMicros: 9_880_100)
         let encoded = VideoWire.encodeFrame(
-            lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true, data: payload)
+            lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true, timing: timing,
+            data: payload)
         #expect(Array(encoded.prefix(5)) == [0x02, 0x01, 0x02, 0x03, 0x04])
+        #expect(encoded.count == 46 + payload.count)
         #expect(
             VideoWire.decode(encoded)
                 == .frame(
                     lane: 0x0102_0304, seq: 12_345, ptsMicros: 9_876_543, keyframe: true,
-                    data: payload))
+                    timing: timing, data: payload))
     }
 }

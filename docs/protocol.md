@@ -161,7 +161,7 @@ reconnecting client gets the full resync again.
 ### Host -> Client
 
 ```
-hello          { protocol: 2, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
+hello          { protocol: 3, lanes: [{ lane: u32, vdsSize: Size }] }  // first message
 windowCreated  { id: u64, lane: u32, app: u32, rect: Rect, title: String, kind: WindowKind }
 windowDestroyed{ id: u64 }
 windowMoved    { id: u64, rect: Rect }                  // ACTUAL geometry, see I-4
@@ -170,6 +170,7 @@ windowFocused  { id: u64 }
 tileLayout     { lane: u32, windows: [{ id: u64, rect: Rect }], displaySize: Size }
 error          { code: u32, message: String }
 menuBar        { app: u32, menus: [MenuItem] }          // after resync, and on change
+pong           { clientMicros: u64, hostMicros: u64 }   // the answer to ping
 ```
 
 `app` is an opaque token for the app that owns a window; `menuBar` carries that
@@ -203,10 +204,17 @@ requestKeyframe{ lane?: u32 }                           // omitted lane = every 
 menuPick       { id: u64, path: [u32], title: String }  // choose a menu item
 menuRefresh    { id: u64 }                              // a menu is opening
 input          { id: u64, event: InputEvent, ts: u64 }
+ping           { clientMicros: u64 }                    // clock probe, answered at once
 ```
 
+**Clock sync (v3).** The client sends `ping` with its own clock and the host
+answers `pong` at once with that value and the host clock (`mach_absolute_time`
+uptime in microseconds, the clock every host stamp uses). The fastest recent
+round trip gives the offset between the clocks, which places the host's frame
+stamps (§6) on the client's timeline.
+
 The host routes each request to the lane that owns the window `id`. Rects stay in
-the VDS of that window's lane. A v1 peer is refused at `hello` (the client reports
+the VDS of that window's lane. A peer of another version is refused at `hello` (the client reports
 "Update Transom on both computers").
 
 `ResizePhase` is `Begin | Live | End`, mapping to `WM_ENTERSIZEMOVE` /
@@ -414,9 +422,17 @@ but the payload is not JSON. The first payload byte is a type tag:
 
 ```
 0x01  config   : lane:u32  hvcC ...                          // HEVC parameter sets (VPS/SPS/PPS)
-0x02  frame    : lane:u32  seq:u64  ptsMicros:u64  flags:u8  hevc...   // one access unit
+0x02  frame    : lane:u32  seq:u64  ptsMicros:u64  flags:u8
+                 capturedMicros:u64  encodedMicros:u64  sentMicros:u64  hevc...   // one access unit
                  flags bit0 = keyframe.  integers big-endian.
 ```
+
+**Stage stamps (v3).** `ptsMicros` is when the frame was composited;
+`capturedMicros`, `encodedMicros` and `sentMicros` are when the capture handed it
+to the encoder, the encoder returned it, and the host began writing it, all on the
+host clock (§4 clock sync). The client stamps arrival, decode and present on its
+own clock and reports each stage (`latency.log` in `%LOCALAPPDATA%\Transom`, and
+`connect --video` prints them).
 
 Each lane is an independent stream: its own config, keyframe gate and `seq`. The
 client keeps one decoder and one texture per lane.

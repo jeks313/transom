@@ -95,7 +95,7 @@ mod tests {
         // Two framed control messages back to back in one buffer.
         let mut stream = Vec::new();
         stream.extend_from_slice(&frame(
-            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":100,"h":100}}]}"#,
+            br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":100,"h":100}}]}"#,
         ));
         stream.extend_from_slice(&frame(br#"{"type":"windowFocused","id":3}"#));
 
@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(
             first,
             ServerMessage::Hello {
-                protocol: 2,
+                protocol: 3,
                 lanes: vec![Lane {
                     lane: 0,
                     vds: Size { w: 100, h: 100 }

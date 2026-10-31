@@ -14,10 +14,12 @@
 //! nothing).
 
 use std::net::TcpStream;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
+use crate::latency::{self, ClockSync, FrameStamps};
 use crate::model::{ModelEvent, WindowModel};
 use crate::net::{self, FramedReceiver};
 use crate::wire::{ClientMessage, ServerMessage, VideoMessage, PROTOCOL_VERSION};
@@ -41,6 +43,7 @@ pub enum SessionEvent {
 ///
 /// `seq`/`pts_micros` are retained for A/V correlation and drop detection even
 /// though the current decode path keys only off arrival order (protocol.md §6).
+/// `stamps` carries the frame's host stage times and its arrival here.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum VideoEvent {
@@ -53,9 +56,16 @@ pub enum VideoEvent {
         seq: u64,
         pts_micros: u64,
         keyframe: bool,
+        stamps: FrameStamps,
         data: Vec<u8>,
     },
 }
+
+/// How often the session probes the host clock: fast at first so the offset
+/// settles within a second, then gently.
+const PING_FAST: Duration = Duration::from_millis(100);
+const PING_SLOW: Duration = Duration::from_secs(1);
+const PING_FAST_COUNT: u32 = 10;
 
 /// A handle to a live session: send requests to the host, and shut it down.
 pub struct Session {
@@ -64,6 +74,9 @@ pub struct Session {
     control_stream: TcpStream,
     video_stream: Option<TcpStream>,
     threads: Vec<JoinHandle<()>>,
+    clock: Arc<Mutex<ClockSync>>,
+    /// Dropped to stop the pinger.
+    stop_pinger: Option<Sender<()>>,
 }
 
 impl Session {
@@ -97,6 +110,8 @@ impl Session {
             control_stream,
             video_stream: None,
             threads: Vec::new(),
+            clock: Arc::new(Mutex::new(ClockSync::default())),
+            stop_pinger: None,
         };
         // Publish display geometry before either reader can publish video.
         // Otherwise a fast video socket can win the scheduling race and its
@@ -108,11 +123,24 @@ impl Session {
         // Control reader: decode messages, fold into the model, emit ModelEvents.
         {
             let tx = tx.clone();
+            let clock = session.clock.clone();
             threads.push(
                 thread::Builder::new()
                     .name("transom-control".into())
-                    .spawn(move || control_loop(control_read, tx, model))
+                    .spawn(move || control_loop(control_read, tx, model, clock))
                     .expect("spawn control thread"),
+            );
+        }
+        // Pinger: keeps the host clock offset fresh for the latency stats.
+        {
+            let (stop, stopped) = mpsc::channel();
+            session.stop_pinger = Some(stop);
+            let write = session.control_write.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("transom-ping".into())
+                    .spawn(move || ping_loop(write, stopped))
+                    .expect("spawn ping thread"),
             );
         }
 
@@ -161,6 +189,11 @@ impl Session {
         net::send_message(&mut *w, msg)
     }
 
+    /// The host-to-client clock mapping, kept fresh by the pinger.
+    pub fn clock(&self) -> Arc<Mutex<ClockSync>> {
+        self.clock.clone()
+    }
+
     /// Tear the session down: shut the sockets so the reader threads unblock and
     /// exit, then join them. Idempotent-ish; safe to call once at end of run.
     pub fn shutdown(self) {
@@ -170,6 +203,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.stop_pinger = None;
         let _ = self.control_stream.shutdown(std::net::Shutdown::Both);
         if let Some(v) = &self.video_stream {
             let _ = v.shutdown(std::net::Shutdown::Both);
@@ -180,11 +214,44 @@ impl Drop for Session {
     }
 }
 
-fn control_loop(stream: TcpStream, tx: Sender<SessionEvent>, mut model: WindowModel) {
+fn ping_loop(write: Arc<Mutex<TcpStream>>, stopped: Receiver<()>) {
+    let mut sent = 0u32;
+    loop {
+        let wait = if sent < PING_FAST_COUNT { PING_FAST } else { PING_SLOW };
+        match stopped.recv_timeout(wait) {
+            Err(RecvTimeoutError::Timeout) => {}
+            _ => return,
+        }
+        let ping = ClientMessage::Ping {
+            client_micros: latency::now_micros(),
+        };
+        let Ok(mut w) = write.lock() else { return };
+        if net::send_message(&mut *w, &ping).is_err() {
+            return;
+        }
+        sent += 1;
+    }
+}
+
+fn control_loop(
+    stream: TcpStream,
+    tx: Sender<SessionEvent>,
+    mut model: WindowModel,
+    clock: Arc<Mutex<ClockSync>>,
+) {
     let mut rx = FramedReceiver::new(stream);
     loop {
         match rx.recv() {
             Ok(Some(payload)) => match ServerMessage::decode(&payload) {
+                Ok(ServerMessage::Pong {
+                    client_micros,
+                    host_micros,
+                }) => {
+                    let now = latency::now_micros();
+                    if let Ok(mut c) = clock.lock() {
+                        c.on_pong(client_micros, host_micros, now);
+                    }
+                }
                 Ok(msg) => {
                     // Surface a protocol-version skew loudly rather than failing
                     // in confusing ways downstream (protocol.md §4 `hello`).
@@ -276,14 +343,24 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>) {
                     seq,
                     pts_micros,
                     keyframe,
+                    timing,
                     data,
                 }) => {
+                    let stamps = FrameStamps {
+                        composited: pts_micros,
+                        captured: timing.captured_micros,
+                        encoded: timing.encoded_micros,
+                        sent: timing.sent_micros,
+                        received: latency::now_micros(),
+                        ..Default::default()
+                    };
                     if tx
                         .send(SessionEvent::Video(VideoEvent::Frame {
                             lane,
                             seq,
                             pts_micros,
                             keyframe,
+                            stamps,
                             data,
                         }))
                         .is_err()
@@ -322,7 +399,7 @@ mod tests {
             let (mut socket, _) = control.accept().unwrap();
             socket
                 .write_all(&crate::wire::frame::frame(
-                    br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
+                    br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
                 ))
                 .unwrap();
             socket
@@ -362,7 +439,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut bytes = crate::wire::frame::frame(
-                br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
+                br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
             );
             bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"lane":0,"app":1,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
             s.write_all(&bytes).unwrap();
@@ -387,8 +464,8 @@ mod tests {
         for payload in [
             br#"{"type":"hello","protocol":1,"vdsSize":{"w":800,"h":600}}"#.as_slice(),
             br#"{"type":"hello","protocol":3,"lanes":[]}"#.as_slice(),
-            br#"{"type":"hello","protocol":2,"lanes":[]}"#.as_slice(),
-            br#"{"type":"hello","protocol":2,"lanes":[{"lane":0,"vdsSize":{"w":0,"h":600}}]}"#
+            br#"{"type":"hello","protocol":3,"lanes":[]}"#.as_slice(),
+            br#"{"type":"hello","protocol":3,"lanes":[{"lane":0,"vdsSize":{"w":0,"h":600}}]}"#
                 .as_slice(),
             br#"{"type":"windowFocused","id":1}"#.as_slice(),
             b"HTTP/1.1 200 OK".as_slice(),

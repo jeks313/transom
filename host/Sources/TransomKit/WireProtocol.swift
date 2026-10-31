@@ -80,7 +80,13 @@ public enum ResizePhase: String, Codable, Sendable {
 }
 
 /// The protocol version carried in `hello`. Bump on any breaking wire change.
-public let transomProtocolVersion = 2
+public let transomProtocolVersion = 3
+
+/// The host clock every timestamp on the wire uses: microseconds of
+/// `mach_absolute_time` uptime, the clock ScreenCaptureKit stamps frames with.
+public enum HostClock {
+    public static func micros() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1000 }
+}
 
 // MARK: - Host -> Client
 
@@ -103,6 +109,9 @@ public enum ControlMessage: Sendable, Equatable {
     /// The menu bar of `app` (the Apple menu left out), for every window it owns.
     /// Sent after the resync and again whenever it changes.
     case menuBar(app: UInt32, menus: [MenuItem])
+    /// The reply to `ping`: the client's stamp back, and the host clock when the
+    /// ping was read, so the client can map host stamps onto its own clock.
+    case pong(clientMicros: UInt64, hostMicros: UInt64)
 }
 
 // MARK: - Client -> Host
@@ -124,6 +133,8 @@ public enum ClientMessage: Sendable, Equatable {
     case menuPick(id: UInt64, path: [UInt32], title: String)
     /// A menu of window `id`'s app is opening: read the menu bar again.
     case menuRefresh(id: UInt64)
+    /// A clock probe, answered at once with `pong` (`clientMicros` is opaque).
+    case ping(clientMicros: UInt64)
 }
 
 // MARK: - Codable (explicit, cross-language JSON)
@@ -132,7 +143,7 @@ extension ControlMessage: Codable {
     private enum Key: String, CodingKey {
         case type, id, lane, app, rect, title, kind, windows, displaySize
         case protocolVersion = "protocol"
-        case lanes, code, message, menus
+        case lanes, code, message, menus, clientMicros, hostMicros
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -177,6 +188,10 @@ extension ControlMessage: Codable {
             try c.encode("menuBar", forKey: .type)
             try c.encode(app, forKey: .app)
             try c.encode(menus, forKey: .menus)
+        case .pong(let clientMicros, let hostMicros):
+            try c.encode("pong", forKey: .type)
+            try c.encode(clientMicros, forKey: .clientMicros)
+            try c.encode(hostMicros, forKey: .hostMicros)
         }
     }
 
@@ -221,6 +236,10 @@ extension ControlMessage: Codable {
             self = .menuBar(
                 app: try c.decode(UInt32.self, forKey: .app),
                 menus: try c.decode([MenuItem].self, forKey: .menus))
+        case "pong":
+            self = .pong(
+                clientMicros: try c.decode(UInt64.self, forKey: .clientMicros),
+                hostMicros: try c.decode(UInt64.self, forKey: .hostMicros))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ControlMessage type \"\(type)\"")
@@ -230,7 +249,7 @@ extension ControlMessage: Codable {
 
 extension ClientMessage: Codable {
     private enum Key: String, CodingKey {
-        case type, id, lane, size, phase, event, ts, path, title
+        case type, id, lane, size, phase, event, ts, path, title, clientMicros
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -263,6 +282,9 @@ extension ClientMessage: Codable {
         case .menuRefresh(let id):
             try c.encode("menuRefresh", forKey: .type)
             try c.encode(id, forKey: .id)
+        case .ping(let clientMicros):
+            try c.encode("ping", forKey: .type)
+            try c.encode(clientMicros, forKey: .clientMicros)
         }
     }
 
@@ -293,6 +315,8 @@ extension ClientMessage: Codable {
                 title: try c.decode(String.self, forKey: .title))
         case "menuRefresh":
             self = .menuRefresh(id: try c.decode(UInt64.self, forKey: .id))
+        case "ping":
+            self = .ping(clientMicros: try c.decode(UInt64.self, forKey: .clientMicros))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown ClientMessage type \"\(type)\"")
@@ -354,7 +378,25 @@ public enum WireCodec {
 public enum VideoWire {
     public enum Message: Equatable, Sendable {
         case config(lane: UInt32, hvcc: Data)
-        case frame(lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data)
+        case frame(
+            lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, timing: FrameTiming,
+            data: Data)
+    }
+
+    /// When a frame passed each host stage, on `HostClock` (v3). `ptsMicros` is
+    /// when it was composited; these follow it.
+    public struct FrameTiming: Equatable, Sendable {
+        /// The capture callback handed it to the encoder.
+        public var capturedMicros: UInt64
+        /// The encoder returned it.
+        public var encodedMicros: UInt64
+        /// The video server began writing it to the socket.
+        public var sentMicros: UInt64
+        public init(capturedMicros: UInt64 = 0, encodedMicros: UInt64 = 0, sentMicros: UInt64 = 0) {
+            self.capturedMicros = capturedMicros
+            self.encodedMicros = encodedMicros
+            self.sentMicros = sentMicros
+        }
     }
 
     public static func encodeConfig(lane: UInt32, hvcc: Data) -> Data {
@@ -365,16 +407,24 @@ public enum VideoWire {
     }
 
     public static func encodeFrame(
-        lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, data: Data
+        lane: UInt32, seq: UInt64, ptsMicros: UInt64, keyframe: Bool,
+        timing: FrameTiming = FrameTiming(), data: Data
     ) -> Data {
         var out = Data([0x02])
+        out.reserveCapacity(frameHeaderLength + data.count)
         out.append(contentsOf: bigEndianBytes(UInt64(lane)).suffix(4))
         out.append(contentsOf: bigEndianBytes(seq))
         out.append(contentsOf: bigEndianBytes(ptsMicros))
         out.append(keyframe ? 1 : 0)
+        out.append(contentsOf: bigEndianBytes(timing.capturedMicros))
+        out.append(contentsOf: bigEndianBytes(timing.encodedMicros))
+        out.append(contentsOf: bigEndianBytes(timing.sentMicros))
         out.append(data)
         return out
     }
+
+    /// tag(1) lane(4) seq(8) pts(8) flags(1) captured(8) encoded(8) sent(8).
+    static let frameHeaderLength = 46
 
     public static func decode(_ payload: Data) -> Message? {
         let bytes = [UInt8](payload)
@@ -384,12 +434,16 @@ public enum VideoWire {
         case 0x01:
             return .config(lane: lane, hvcc: Data(bytes[5...]))
         case 0x02:
-            guard bytes.count >= 22 else { return nil }
+            guard bytes.count >= frameHeaderLength else { return nil }
             let seq = beUInt64(bytes, 5)
             let pts = beUInt64(bytes, 13)
             let keyframe = bytes[21] != 0
+            let timing = FrameTiming(
+                capturedMicros: beUInt64(bytes, 22), encodedMicros: beUInt64(bytes, 30),
+                sentMicros: beUInt64(bytes, 38))
             return .frame(
-                lane: lane, seq: seq, ptsMicros: pts, keyframe: keyframe, data: Data(bytes[22...]))
+                lane: lane, seq: seq, ptsMicros: pts, keyframe: keyframe, timing: timing,
+                data: Data(bytes[frameHeaderLength...]))
         default:
             return nil
         }

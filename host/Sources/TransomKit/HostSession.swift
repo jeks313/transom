@@ -432,6 +432,8 @@ public final class HostSession: @unchecked Sendable {
                     case let .menuRefresh(id):
                         guard let lane = lane(owning: id) else { break }
                         self?.readMenus(pid: pid_t(bitPattern: ControlServer.app(of: id, in: lane.registry)))
+                    case .ping:
+                        break  // answered by the control server
                     case let .requestKeyframe(laneID):
                         // A client may deliberately drop stale compressed frames
                         // to protect interaction latency. Restart its dependency
@@ -743,7 +745,9 @@ public final class HostSession: @unchecked Sendable {
             }
             cap.onPixelBuffer = { [weak self] pixelBuffer, pts in
                 self?.markEncodeStart(lane: laneID)
-                try? enc.encode(pixelBuffer, pts: pts, duration: frameDuration)
+                try? enc.encode(
+                    pixelBuffer, pts: pts, duration: frameDuration,
+                    capturedMicros: HostClock.micros())
             }
             // The prompt lane has nothing to capture until a prompt is adopted.
             if !lane.isPromptLane { try await cap.start() }

@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+use crate::latency::LatencyStats;
 use crate::model::ModelEvent;
 use crate::session::{Session, SessionEvent, VideoEvent};
 use crate::vk;
@@ -85,6 +86,8 @@ pub fn run(args: &[String]) -> ExitCode {
             || opts.menu_pick.is_some();
 
     let mut frames = 0u64;
+    let clock = session.clock();
+    let mut latency: HashMap<u32, LatencyStats> = HashMap::new();
     let mut video_bytes = 0u64;
     let mut last_video_report = Instant::now();
 
@@ -130,13 +133,18 @@ pub fn run(args: &[String]) -> ExitCode {
                 );
             }
             SessionEvent::Video(VideoEvent::Frame {
+                lane,
                 seq,
                 keyframe,
+                stamps,
                 data,
                 ..
             }) => {
                 frames += 1;
                 video_bytes += data.len() as u64;
+                if let Ok(c) = clock.lock() {
+                    latency.entry(lane).or_default().record(&stamps, &c);
+                }
                 // Rate-limit the video log to once a second so it doesn't drown the
                 // control-plane trace.
                 if last_video_report.elapsed() >= Duration::from_secs(1) {
@@ -148,6 +156,15 @@ pub fn run(args: &[String]) -> ExitCode {
                         now_ms(),
                         if keyframe { "keyframe" } else { "delta" }
                     );
+                    let rtt = clock.lock().ok().and_then(|c| c.min_rtt_micros());
+                    if let Some(rtt) = rtt {
+                        println!("           rtt {:.1} ms (fastest of recent pings)", rtt as f64 / 1000.0);
+                    }
+                    let mut lanes: Vec<_> = latency.iter().collect();
+                    lanes.sort_by_key(|(l, _)| **l);
+                    for (lane, stats) in lanes {
+                        println!("           lane {lane}: {}", stats.summary());
+                    }
                     video_bytes = 0;
                     last_video_report = Instant::now();
                 }

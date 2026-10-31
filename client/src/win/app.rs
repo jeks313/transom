@@ -44,6 +44,7 @@ use super::input;
 use super::menu::MenuBar;
 use super::proxy::Proxy;
 use crate::model::{ModelEvent, Window};
+use crate::latency::{self, FrameStamps, LatencyStats, STAGES};
 use crate::session::{Session, SessionEvent, VideoEvent};
 use crate::wire::{ClientMessage, InputEvent, MenuItem, Rect, ResizePhase, Size, WindowKind};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
@@ -93,6 +94,9 @@ pub struct App {
     notice: Option<String>,
     video_notice: Option<String>,
     session: Option<Session>,
+    /// When stage latency was last logged, and the worst lane's median total.
+    latency_reported: Instant,
+    latency_ms: Option<f32>,
     rx: Option<std::sync::mpsc::Receiver<SessionEvent>>,
     proxies: HashMap<u64, Proxy>,
     windows: HashMap<u64, Window>,
@@ -128,6 +132,33 @@ struct LaneVideo {
     video_in: u64,
     video_decoded: u64,
     warned_no_decode: bool,
+    /// Per-stage latency of presented frames, and the frame uploaded since the
+    /// last present (stamped `presented` once drawn).
+    latency: LatencyStats,
+    shown: Option<FrameStamps>,
+}
+
+/// Append stage-latency lines to `%LOCALAPPDATA%\Transom\latency.log`, kept
+/// under about a megabyte.
+fn latency_log(lines: &[String]) {
+    use std::io::Write;
+    let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(dir).join("Transom").join("latency.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for line in lines {
+        let _ = writeln!(file, "{stamp} {line}");
+    }
 }
 
 /// The texture a window samples from: its lane's.
@@ -169,6 +200,8 @@ impl App {
             notice: None,
             video_notice: None,
             session: None,
+            latency_reported: Instant::now(),
+            latency_ms: None,
             rx: None,
             proxies: HashMap::new(),
             windows: HashMap::new(),
@@ -297,7 +330,10 @@ impl App {
             } else if self.cfg.video_port.is_none() {
                 "Control only · video is off".into()
             } else if self.lanes.values().any(|l| l.video_decoded > 0) {
-                "Streaming".into()
+                match self.latency_ms {
+                    Some(ms) => format!("Streaming, {ms:.0} ms behind the Mac"),
+                    None => "Streaming".into(),
+                }
             } else {
                 "Waiting for video…".into()
             };
@@ -317,6 +353,7 @@ impl App {
         self.menu_refreshed.clear();
         self.notice = None;
         self.video_notice = None;
+        self.latency_ms = None;
         let ids: Vec<_> = self.proxies.keys().copied().collect();
         for id in ids {
             self.destroy_proxy(id);
@@ -435,6 +472,8 @@ impl App {
                             video_in: 0,
                             video_decoded: 0,
                             warned_no_decode: false,
+                            latency: LatencyStats::default(),
+                            shown: None,
                         },
                     );
                     self.ensure_source(lane.lane);
@@ -556,6 +595,7 @@ impl App {
                 data,
                 keyframe,
                 pts_micros,
+                stamps,
                 ..
             } => {
                 let Some(l) = self.lanes.get_mut(&lane) else {
@@ -570,7 +610,11 @@ impl App {
                     );
                 }
                 if let Some(decoder) = l.decoder.as_ref() {
-                    decoder.submit(data, keyframe, pts_micros);
+                    let stamps = FrameStamps {
+                        submitted: latency::now_micros(),
+                        ..stamps
+                    };
+                    decoder.submit(data, keyframe, pts_micros, stamps);
                 }
                 // A newly connected client must wait for a complete keyframe.
                 // Preserve any more specific error reported by the worker.
@@ -629,6 +673,7 @@ impl App {
         };
         if let (Some(frame), Some(source)) = (frame, lane.source.as_ref()) {
             source.update_nv12(&self.gpu, &frame.nv12, frame.stride);
+            lane.shown = Some(frame.stamps);
             self.dashboard
                 .update_previews_nv12(id, &frame.nv12, frame.stride, lane.vds);
             lane.video_decoded += 1;
@@ -906,6 +951,52 @@ impl App {
             }
             // The resulting WM_SIZE resizes the swapchain to the exact rect.
         }
+    }
+
+    /// Stamp the frames `render_all` just presented, and every few seconds log
+    /// each lane's stage latency and show the whole in the status line.
+    fn record_presented(&mut self) {
+        let Some(clock) = self.session.as_ref().map(Session::clock) else {
+            return;
+        };
+        let Ok(clock) = clock.lock() else { return };
+        let now = latency::now_micros();
+        for lane in self.lanes.values_mut() {
+            if let Some(stamps) = lane.shown.take() {
+                lane.latency.record(
+                    &FrameStamps {
+                        presented: now,
+                        ..stamps
+                    },
+                    &clock,
+                );
+            }
+        }
+        if self.latency_reported.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.latency_reported = Instant::now();
+        let mut lines = Vec::new();
+        if let Some(rtt) = clock.min_rtt_micros() {
+            lines.push(format!("rtt {:.1} ms", rtt as f64 / 1000.0));
+        }
+        let mut ids: Vec<_> = self.lanes.keys().copied().collect();
+        ids.sort_unstable();
+        let mut total = None;
+        for id in ids {
+            let stats = &self.lanes[&id].latency;
+            if let Some(p50) = stats.percentile(STAGES.len() - 1, 0.5) {
+                total = Some(total.map_or(p50, |t: f32| t.max(p50)));
+                lines.push(format!("lane {id}: {}", stats.summary()));
+            }
+        }
+        drop(clock);
+        if total.is_none() {
+            return;
+        }
+        latency_log(&lines);
+        self.latency_ms = total;
+        self.update_status();
     }
 
     fn render_all(&mut self) {
@@ -1407,6 +1498,7 @@ fn tick(app_ptr: *mut App) {
         (*app_ptr).poll_decoder();
         (*app_ptr).flush_mouse_moves();
         (*app_ptr).render_all();
+        (*app_ptr).record_presented();
     }
     IN_TICK.with(|busy| busy.set(false));
 }

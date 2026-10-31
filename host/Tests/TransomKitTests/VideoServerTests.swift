@@ -52,7 +52,7 @@ struct VideoServerTests {
             let messages = await transport.messages
             try #require(messages.count == 2)
             #expect(VideoWire.decode(messages[0]) == .config(lane: 0, hvcc: config))
-            if case .frame(_, _, _, let keyframe, _)? = VideoWire.decode(messages[1]) {
+            if case .frame(_, _, _, let keyframe, _, _)? = VideoWire.decode(messages[1]) {
                 #expect(keyframe)
             } else {
                 Issue.record("Expected a keyframe after config")
@@ -80,7 +80,7 @@ struct VideoServerTests {
         let shape = decoded.map { message -> String in
             switch message {
             case .config(let lane, _): return "config\(lane)"
-            case .frame(let lane, let seq, _, let key, _): return "\(key ? "key" : "delta")\(lane)#\(seq)"
+            case .frame(let lane, let seq, _, let key, _, _): return "\(key ? "key" : "delta")\(lane)#\(seq)"
             }
         }
         #expect(shape == ["config0", "key0#0", "config1", "key1#0", "delta0#1"])
