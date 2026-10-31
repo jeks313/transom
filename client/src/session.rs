@@ -59,6 +59,8 @@ pub enum VideoEvent {
         pts_micros: u64,
         keyframe: bool,
         stamps: FrameStamps,
+        /// The window's part of the decoded picture, from its top left.
+        content: (u32, u32),
         data: Vec<u8>,
     },
 }
@@ -378,6 +380,8 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>, sink: Option<VideoSin
                     pts_micros,
                     keyframe,
                     timing,
+                    width,
+                    height,
                     data,
                 }) => {
                     let stamps = FrameStamps {
@@ -394,6 +398,7 @@ fn video_loop(stream: TcpStream, tx: Sender<SessionEvent>, sink: Option<VideoSin
                         pts_micros,
                         keyframe,
                         stamps,
+                        content: (width, height),
                         data,
                     }) {
                         return;
@@ -430,7 +435,7 @@ mod tests {
             let (mut socket, _) = control.accept().unwrap();
             socket
                 .write_all(&crate::wire::frame::frame(
-                    br#"{"type":"hello","protocol":4,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
+                    br#"{"type":"hello","protocol":5,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
                 ))
                 .unwrap();
             socket
@@ -472,7 +477,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut bytes = crate::wire::frame::frame(
-                br#"{"type":"hello","protocol":4,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
+                br#"{"type":"hello","protocol":5,"lanes":[{"lane":0,"vdsSize":{"w":800,"h":600}}]}"#,
             );
             bytes.extend(crate::wire::frame::frame(br#"{"type":"windowCreated","id":1,"lane":0,"app":1,"title":"Test","kind":"normal","rect":{"x":0,"y":0,"w":400,"h":300}}"#));
             s.write_all(&bytes).unwrap();
@@ -496,9 +501,9 @@ mod tests {
     fn refuses_wrong_service_version_and_invalid_dimensions() {
         for payload in [
             br#"{"type":"hello","protocol":1,"vdsSize":{"w":800,"h":600}}"#.as_slice(),
-            br#"{"type":"hello","protocol":4,"lanes":[]}"#.as_slice(),
-            br#"{"type":"hello","protocol":4,"lanes":[]}"#.as_slice(),
-            br#"{"type":"hello","protocol":4,"lanes":[{"lane":0,"vdsSize":{"w":0,"h":600}}]}"#
+            br#"{"type":"hello","protocol":5,"lanes":[]}"#.as_slice(),
+            br#"{"type":"hello","protocol":5,"lanes":[]}"#.as_slice(),
+            br#"{"type":"hello","protocol":5,"lanes":[{"lane":0,"vdsSize":{"w":0,"h":600}}]}"#
                 .as_slice(),
             br#"{"type":"windowFocused","id":1}"#.as_slice(),
             b"HTTP/1.1 200 OK".as_slice(),

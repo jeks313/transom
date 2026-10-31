@@ -142,6 +142,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 seq,
                 keyframe,
                 stamps,
+                content,
                 data,
                 ..
             }) => {
@@ -157,9 +158,11 @@ pub fn run(args: &[String]) -> ExitCode {
                         / 1_000_000.0
                         / last_video_report.elapsed().as_secs_f64();
                     println!(
-                        "[{:>6}ms] video: {frames} frames, {mbps:.1} Mbps (last seq {seq}, {})",
+                        "[{:>6}ms] video: {frames} frames, {mbps:.1} Mbps (last seq {seq} of window {stream}, {}, {}x{})",
                         now_ms(),
-                        if keyframe { "keyframe" } else { "delta" }
+                        if keyframe { "keyframe" } else { "delta" },
+                        content.0,
+                        content.1
                     );
                     let rtt = clock.lock().ok().and_then(|c| c.min_rtt_micros());
                     if let Some(rtt) = rtt {

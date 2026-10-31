@@ -54,6 +54,10 @@ public final class HEVCEncoder: @unchecked Sendable {
         /// encoder returned it.
         public var capturedMicros: UInt64 = 0
         public var encodedMicros: UInt64 = 0
+        /// The part of the picture its source filled, from the top left, as
+        /// passed to `encode`; zero when it filled all of it.
+        public var contentWidth = 0
+        public var contentHeight = 0
     }
 
     /// The chroma / bit-depth the stream is encoded at. The default is the mode
@@ -338,9 +342,11 @@ public final class HEVCEncoder: @unchecked Sendable {
     /// full-frame BGRA→NV12 transfer. The 4:4:4 mode keeps the media-engine
     /// conversion path. `done` runs once the encoder has finished with the
     /// frame, encoded or dropped, on a VideoToolbox thread; not when this throws.
+    /// `content` is how much of the picture the source fills, handed back with
+    /// the encoded frame.
     public func encode(
         _ source: CVPixelBuffer, pts: CMTime, duration: CMTime, capturedMicros: UInt64 = 0,
-        done: (@Sendable () -> Void)? = nil
+        content: (width: Int, height: Int) = (0, 0), done: (@Sendable () -> Void)? = nil
     ) throws {
         let state = Log.signposter.beginInterval("encode")
         defer { Log.signposter.endInterval("encode", state) }
@@ -377,7 +383,7 @@ public final class HEVCEncoder: @unchecked Sendable {
         let handler: VTCompressionOutputHandler = { [weak self] status, _, sampleBuffer in
             defer { done?() }
             guard let self, status == noErr, let sampleBuffer else { return }
-            self.emit(sampleBuffer, capturedMicros: capturedMicros)
+            self.emit(sampleBuffer, capturedMicros: capturedMicros, content: content)
         }
         let forceKeyframe = keyframeLock.withLock {
             let requested = forceNextKeyframe
@@ -400,7 +406,9 @@ public final class HEVCEncoder: @unchecked Sendable {
         }
     }
 
-    private func emit(_ sampleBuffer: CMSampleBuffer, capturedMicros: UInt64) {
+    private func emit(
+        _ sampleBuffer: CMSampleBuffer, capturedMicros: UInt64, content: (width: Int, height: Int)
+    ) {
         let encodedMicros = HostClock.micros()
         let byteCount = CMSampleBufferGetTotalSampleSize(sampleBuffer)
         guard byteCount > 0 else { return }
@@ -428,7 +436,8 @@ public final class HEVCEncoder: @unchecked Sendable {
         onEncodedFrame?(
             EncodedFrame(
                 byteCount: byteCount, pts: pts, isKeyframe: isKeyframe, data: data,
-                capturedMicros: capturedMicros, encodedMicros: encodedMicros))
+                capturedMicros: capturedMicros, encodedMicros: encodedMicros,
+                contentWidth: content.width, contentHeight: content.height))
     }
 
     /// Copy the contiguous encoded bytes out of a sample buffer for the wire.

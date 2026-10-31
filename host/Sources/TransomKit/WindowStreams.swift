@@ -14,8 +14,14 @@ import Metal
 /// GPU, and encoded, each by an encoder of its own size. Typing in one window
 /// costs that window's pixels; a still window costs nothing.
 ///
-/// `process` runs on the capture queue. A window that changes size gets a new
-/// encoder (`generation` + 1), whose first frame is a keyframe.
+/// `process` runs on the capture queue.
+///
+/// A window keeps its encoder through a resize while it fits (v5): the window
+/// fills the top left of the encoder's picture, the rest is black, and every
+/// frame says how much is window. One that outgrows its encoder gets a new one
+/// (`generation` + 1, its first frame a keyframe) with room to grow
+/// (`EncoderSizing`), so a drag costs a keyframe every so often instead of one
+/// per step, and once the size has settled it goes back to an exact fit.
 ///
 /// Each encoder has at most `maxInFlight` frames in flight. When the encoder
 /// cannot keep up with the capture rate, frames would otherwise queue inside
@@ -37,8 +43,13 @@ public final class WindowStreams: @unchecked Sendable {
     /// Unchecked: `crop` stays on the capture queue and the rest is under `lock`.
     private final class Stream: @unchecked Sendable {
         let encoder: HEVCEncoder
-        /// Touched only on the capture queue.
+        /// The encoder's picture size.
+        let capacity: CGSize
+        /// Touched only on the capture queue: the window's part of the lane,
+        /// since when it has been this size, and black of `capacity` to pad with.
         var crop: CGRect
+        var sizedAt: TimeInterval
+        var blank: CVPixelBuffer?
         let generation: UInt32
         let pool: CVPixelBufferPool
         /// Under `WindowStreams.lock`: frames with the encoder, and the newest
@@ -46,9 +57,14 @@ public final class WindowStreams: @unchecked Sendable {
         var inFlight = 0
         var waiting: Frame?
         var closed = false
-        init(encoder: HEVCEncoder, crop: CGRect, generation: UInt32, pool: CVPixelBufferPool) {
+        init(
+            encoder: HEVCEncoder, capacity: CGSize, crop: CGRect, generation: UInt32,
+            pool: CVPixelBufferPool
+        ) {
             self.encoder = encoder
+            self.capacity = capacity
             self.crop = crop
+            self.sizedAt = ProcessInfo.processInfo.systemUptime
             self.generation = generation
             self.pool = pool
         }
@@ -62,6 +78,8 @@ public final class WindowStreams: @unchecked Sendable {
         let pts: CMTime
         let capturedMicros: UInt64
         let keyframe: Bool
+        /// The window's part of `buffer`, from its top left.
+        let content: CGSize
     }
     /// Touched only on the capture queue.
     private var streams: [UInt64: Stream] = [:]
@@ -124,25 +142,39 @@ public final class WindowStreams: @unchecked Sendable {
             return (pendingAll, pending)
         }
 
+        let now = ProcessInfo.processInfo.systemUptime
+        let lane = CGSize(width: bounds.w, height: bounds.h)
         var work: [(id: UInt64, stream: Stream, keyframe: Bool)] = []
         for entry in entries {
             guard let crop = WindowCrop.clip(entry.rect, width: bounds.w, height: bounds.h)
             else { continue }
             var keyframe = all || asked.contains(entry.id)
-            let changed = WindowCrop.isDirty(crop, dirty: dirty)
+            var changed = WindowCrop.isDirty(crop, dirty: dirty)
             var stream = streams[entry.id]
-            if stream == nil || stream!.crop.size != crop.size {
-                guard failed[entry.id] != crop.size else { continue }
+            if let s = stream, s.crop.size != crop.size {
+                s.sizedAt = now
+                changed = true
+            }
+            let capacity = EncoderSizing.capacity(
+                current: stream?.capacity, window: crop.size,
+                settledFor: stream.map { now - $0.sizedAt } ?? 0, lane: lane)
+            if let capacity {
+                guard failed[entry.id] != capacity else { continue }
                 if let old = stream { close(old) }
-                stream = makeStream(id: entry.id, crop: crop)
+                stream = makeStream(id: entry.id, capacity: capacity, crop: crop)
                 streams[entry.id] = stream
                 guard stream != nil else { continue }
                 keyframe = true
-            } else if stream!.crop.origin != crop.origin {
-                // Moved: same encoder, new place in the lane.
-                stream!.crop = crop
             }
-            guard let stream, keyframe || changed else { continue }
+            guard let stream else { continue }
+            // Moved or resized within its encoder: a new part of the lane.
+            stream.crop = crop
+            if crop.size != stream.capacity && stream.blank == nil {
+                stream.blank = FrameCropper.blank(
+                    like: format.capturePixelFormat, width: Int(stream.capacity.width),
+                    height: Int(stream.capacity.height))
+            }
+            guard keyframe || changed else { continue }
             work.append((entry.id, stream, keyframe))
         }
         guard !work.isEmpty else { return }
@@ -154,10 +186,15 @@ public final class WindowStreams: @unchecked Sendable {
             guard let out else { return }
             targets.append(out)
         }
-        guard cropper.crop(buffer, rects: work.map(\.stream.crop), into: targets) else { return }
+        guard
+            cropper.crop(
+                buffer, rects: work.map(\.stream.crop), into: targets,
+                blanks: work.map(\.stream.blank))
+        else { return }
         for (item, target) in zip(work, targets) {
             let frame = Frame(
-                buffer: target, pts: pts, capturedMicros: capturedMicros, keyframe: item.keyframe)
+                buffer: target, pts: pts, capturedMicros: capturedMicros, keyframe: item.keyframe,
+                content: item.stream.crop.size)
             let send: Bool = lock.withLock {
                 let stream = item.stream
                 guard stream.inFlight >= Self.maxInFlight else {
@@ -168,7 +205,7 @@ public final class WindowStreams: @unchecked Sendable {
                 let keyframe = frame.keyframe || (stream.waiting?.keyframe ?? false)
                 stream.waiting = Frame(
                     buffer: frame.buffer, pts: frame.pts, capturedMicros: frame.capturedMicros,
-                    keyframe: keyframe)
+                    keyframe: keyframe, content: frame.content)
                 return false
             }
             if send { submit(frame, to: item.stream) }
@@ -183,7 +220,8 @@ public final class WindowStreams: @unchecked Sendable {
         do {
             try stream.encoder.encode(
                 frame.buffer, pts: frame.pts, duration: duration,
-                capturedMicros: frame.capturedMicros
+                capturedMicros: frame.capturedMicros,
+                content: (Int(frame.content.width), Int(frame.content.height))
             ) { [weak self, stream] in self?.next(after: stream) }
         } catch {
             next(after: stream)
@@ -216,9 +254,9 @@ public final class WindowStreams: @unchecked Sendable {
         streams = [:]
     }
 
-    private func makeStream(id: UInt64, crop: CGRect) -> Stream? {
-        let width = Int(crop.width)
-        let height = Int(crop.height)
+    private func makeStream(id: UInt64, capacity: CGSize, crop: CGRect) -> Stream? {
+        let width = Int(capacity.width)
+        let height = Int(capacity.height)
         do {
             let encoder = try HEVCEncoder(
                 config: HEVCEncoder.Config(
@@ -237,18 +275,55 @@ public final class WindowStreams: @unchecked Sendable {
                 sink(
                     VideoServer.StreamFrame(
                         stream: id, generation: generation, width: UInt32(width),
-                        height: UInt32(height), hvcc: encoder?.parameterSetsHVCC, frame: frame))
+                        height: UInt32(height), contentWidth: UInt32(frame.contentWidth),
+                        contentHeight: UInt32(frame.contentHeight),
+                        hvcc: encoder?.parameterSetsHVCC, frame: frame))
             }
             lock.withLock { _usingHardware = _usingHardware && encoder.usingHardware }
             onEncoderCreated?(encoder)
-            return Stream(encoder: encoder, crop: crop, generation: generation, pool: pool)
+            return Stream(
+                encoder: encoder, capacity: capacity, crop: crop, generation: generation, pool: pool)
         } catch {
             Log.encode.notice(
                 "video: no encoder for window \(id, privacy: .public) at \(width, privacy: .public)x\(height, privacy: .public): \(String(describing: error), privacy: .public)"
             )
-            failed[id] = crop.size
+            failed[id] = capacity
             return nil
         }
+    }
+}
+
+/// How big a window's encoder is. Pure, so it is unit tested.
+///
+/// Encode time follows the encoder's pixels, not the window's, so a still
+/// window fits its encoder exactly. One that outgrows it is being resized, and
+/// gets room to keep growing; once its size has held for `settle`, it fits
+/// exactly again.
+public enum EncoderSizing {
+    /// Room to grow, on each side, after outgrowing an encoder.
+    static let headroom = 1.25
+    /// Sides are rounded up to this, which keeps sizes even for 4:2:0.
+    static let step = 64
+    /// How long a size must hold before an oversized encoder is replaced.
+    static let settle: TimeInterval = 1.5
+
+    /// The size of a new encoder for a window of `window`, or nil to keep the
+    /// one of `current` size (nil when there is none). `settledFor` is how long
+    /// the window has been this size; `lane` bounds the encoder.
+    public static func capacity(
+        current: CGSize?, window: CGSize, settledFor: TimeInterval, lane: CGSize
+    ) -> CGSize? {
+        guard let current else { return window }
+        if window.width > current.width || window.height > current.height {
+            func grow(_ side: CGFloat, _ limit: CGFloat) -> CGFloat {
+                let room = (Int((side * headroom).rounded(.up)) + step - 1) / step * step
+                return max(side, min(CGFloat(room), CGFloat(Int(limit) & ~1)))
+            }
+            return CGSize(
+                width: grow(window.width, lane.width), height: grow(window.height, lane.height))
+        }
+        if window != current && settledFor >= settle { return window }
+        return nil
     }
 }
 
@@ -323,9 +398,41 @@ final class FrameCropper {
         }
     }
 
-    /// Copy each of `rects` (pixels, even) of `source` into the matching target,
+    /// A buffer of black, to pad a window smaller than its encoder with.
+    static func blank(like pixelFormat: OSType, width: Int, height: Int) -> CVPixelBuffer? {
+        guard let pool = pool(like: pixelFormat, width: width, height: height) else { return nil }
+        var out: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &out)
+        guard let out, CVPixelBufferLockBaseAddress(out, []) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(out, []) }
+        func fill(_ base: UnsafeMutableRawPointer?, _ bytes: Int, _ pattern: [UInt8]) {
+            guard let base else { return }
+            let p = base.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<bytes { p[i] = pattern[i % pattern.count] }
+        }
+        if CVPixelBufferIsPlanar(out) {
+            // Video-range NV12: Y 16, Cb Cr 128.
+            for (plane, value) in [(0, [UInt8(16)]), (1, [UInt8(128)])] {
+                fill(
+                    CVPixelBufferGetBaseAddressOfPlane(out, plane),
+                    CVPixelBufferGetBytesPerRowOfPlane(out, plane)
+                        * CVPixelBufferGetHeightOfPlane(out, plane), value)
+            }
+        } else {
+            fill(
+                CVPixelBufferGetBaseAddress(out),
+                CVPixelBufferGetBytesPerRow(out) * CVPixelBufferGetHeight(out), [0, 0, 0, 255])
+        }
+        return out
+    }
+
+    /// Copy each of `rects` (pixels, even) of `source` into the top left of the
+    /// matching target, and the matching blank's black into the rest of it,
     /// waiting until the GPU has done it.
-    func crop(_ source: CVPixelBuffer, rects: [CGRect], into targets: [CVPixelBuffer]) -> Bool {
+    func crop(
+        _ source: CVPixelBuffer, rects: [CGRect], into targets: [CVPixelBuffer],
+        blanks: [CVPixelBuffer?]
+    ) -> Bool {
         guard let planes = Self.planes(of: CVPixelBufferGetPixelFormatType(source)),
             let commands = queue.makeCommandBuffer(), let blit = commands.makeBlitCommandEncoder()
         else { return false }
@@ -348,16 +455,29 @@ final class FrameCropper {
                 blit.endEncoding()
                 return false
             }
-            for (rect, target) in zip(rects, targets) {
+            for (i, (rect, target)) in zip(rects, targets).enumerated() {
                 guard let to = texture(target, plane: plane, format: format) else { continue }
+                let w = min(Int(rect.width) / scale, to.width)
+                let h = min(Int(rect.height) / scale, to.height)
                 blit.copy(
                     from: from, sourceSlice: 0, sourceLevel: 0,
                     sourceOrigin: MTLOrigin(x: Int(rect.minX) / scale, y: Int(rect.minY) / scale, z: 0),
-                    sourceSize: MTLSize(
-                        width: min(Int(rect.width) / scale, to.width),
-                        height: min(Int(rect.height) / scale, to.height), depth: 1),
+                    sourceSize: MTLSize(width: w, height: h, depth: 1),
                     to: to, destinationSlice: 0, destinationLevel: 0,
                     destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                guard w < to.width || h < to.height, i < blanks.count, let blank = blanks[i],
+                    let black = texture(blank, plane: plane, format: format)
+                else { continue }
+                // Right of the window, then below it.
+                for (x, y, bw, bh) in [(w, 0, to.width - w, to.height), (0, h, w, to.height - h)]
+                where bw > 0 && bh > 0 {
+                    blit.copy(
+                        from: black, sourceSlice: 0, sourceLevel: 0,
+                        sourceOrigin: MTLOrigin(x: x, y: y, z: 0),
+                        sourceSize: MTLSize(width: bw, height: bh, depth: 1),
+                        to: to, destinationSlice: 0, destinationLevel: 0,
+                        destinationOrigin: MTLOrigin(x: x, y: y, z: 0))
+                }
             }
         }
         blit.endEncoding()

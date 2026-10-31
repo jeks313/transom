@@ -318,6 +318,9 @@ impl Gpu {
 pub struct SourceTexture {
     pub width: u32,
     pub height: u32,
+    /// The window's part of the frame, from the top left (v5): the stream pads
+    /// a window smaller than its encoder.
+    pub content: (u32, u32),
     texture: ID3D11Texture2D,
     /// Luma (R8) and chroma (R8G8) views.
     pub planes: [Option<ID3D11ShaderResourceView>; 2],
@@ -364,6 +367,7 @@ impl SourceTexture {
         Ok(SourceTexture {
             width,
             height,
+            content: (width, height),
             texture,
             planes,
         })
@@ -392,6 +396,15 @@ impl SourceTexture {
     /// an NV12 texture of the same size.
     pub fn copy_from(&self, gpu: &Gpu, frame: &ID3D11Texture2D) {
         unsafe { gpu.context.CopyResource(&self.texture, frame) };
+    }
+
+    /// Take the window's part of the newest frame; zero (or too big) is all of it.
+    pub fn set_content(&mut self, (w, h): (u32, u32)) {
+        self.content = if w == 0 || h == 0 {
+            (self.width, self.height)
+        } else {
+            (w.min(self.width), h.min(self.height))
+        };
     }
 
     /// The UV sub-rect (origin + size in [0,1]) for a window's source rect.

@@ -27,6 +27,10 @@ pub enum VideoMessage {
         pts_micros: u64,
         keyframe: bool,
         timing: FrameTiming,
+        /// The window's part of the picture, from its top left (v5); the rest
+        /// pads it to the stream's `Config` size.
+        width: u32,
+        height: u32,
         data: Vec<u8>,
     },
 }
@@ -69,8 +73,8 @@ const STREAM_HEADER_LEN: usize = 1 + 8;
 /// The config header: stream header + width(4) + height(4).
 const CONFIG_HEADER_LEN: usize = STREAM_HEADER_LEN + 4 + 4;
 /// The fixed frame header: stream header + seq(8) + pts(8) + flags(1) +
-/// captured(8) + encoded(8) + sent(8).
-const FRAME_HEADER_LEN: usize = STREAM_HEADER_LEN + 8 + 8 + 1 + 24;
+/// captured(8) + encoded(8) + sent(8) + width(4) + height(4).
+const FRAME_HEADER_LEN: usize = STREAM_HEADER_LEN + 8 + 8 + 1 + 24 + 8;
 
 impl VideoMessage {
     /// Decode one de-framed video-channel payload.
@@ -110,6 +114,8 @@ impl VideoMessage {
                     pts_micros: be_u64(&payload[17..25]),
                     keyframe: payload[25] & 0x01 != 0,
                     timing,
+                    width: be_u32(&payload[50..54]),
+                    height: be_u32(&payload[54..58]),
                     data: payload[FRAME_HEADER_LEN..].to_vec(),
                 })
             }
@@ -142,6 +148,8 @@ mod tests {
         for stamp in [pts + 100, pts + 4_000, pts + 4_050] {
             out.extend_from_slice(&stamp.to_be_bytes());
         }
+        out.extend_from_slice(&1568u32.to_be_bytes());
+        out.extend_from_slice(&1420u32.to_be_bytes());
         out.extend_from_slice(data);
         out
     }
@@ -179,6 +187,8 @@ mod tests {
                     encoded_micros: 20_000,
                     sent_micros: 20_050,
                 },
+                width: 1568,
+                height: 1420,
                 data: vec![1, 2, 3],
             }
         );
@@ -206,7 +216,7 @@ mod tests {
 
     #[test]
     fn rejects_short_messages() {
-        // Tag + stream only: well under the 50-byte frame header.
+        // Tag + stream only: well under the 58-byte frame header.
         assert_eq!(
             VideoMessage::decode(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(VideoDecodeError::TruncatedFrame(9))

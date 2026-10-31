@@ -45,8 +45,8 @@ struct VideoServerTests {
         messages.compactMap(VideoWire.decode).map { message -> String in
             switch message {
             case .config(let stream, let w, let h, _): return "config\(stream) \(w)x\(h)"
-            case .frame(let stream, let seq, _, let key, _, _):
-                return "\(key ? "key" : "delta")\(stream)#\(seq)"
+            case .frame(let stream, let seq, _, let key, _, let w, let h, _):
+                return "\(key ? "key" : "delta")\(stream)#\(seq)" + (w == 640 && h == 480 ? "" : " \(w)x\(h)")
             }
         }
     }

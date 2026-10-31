@@ -166,7 +166,7 @@ impl Proxy {
         // new size's encoder starts.
         let stretch = self.in_size_move && self.resizing;
         let (tex_w, tex_h) = source_tex
-            .map(|t| (t.width, t.height))
+            .map(|t| t.content)
             .unwrap_or((self.source.w, self.source.h));
         let draw_w = if stretch || self.checkerboard {
             self.width

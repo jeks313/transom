@@ -296,8 +296,15 @@ impl Dashboard {
         }
     }
     /// Refresh the cards of `lane`'s windows from its newest decoded frame.
-    /// Window `id`'s own frame, for its card.
-    pub fn update_preview_nv12(&mut self, id: u64, nv12: &[u8], stride: usize, frame: Size) {
+    /// Window `id`'s own frame, for its card; the window fills `content` of it.
+    pub fn update_preview_nv12(
+        &mut self,
+        id: u64,
+        nv12: &[u8],
+        stride: usize,
+        frame: Size,
+        content: Size,
+    ) {
         let last = self
             .state
             .last_preview
@@ -308,7 +315,7 @@ impl Dashboard {
         }
         *last = Instant::now();
         for c in self.state.cards.iter_mut().filter(|c| c.window.id == id) {
-            c.update_preview_nv12(nv12, stride, frame);
+            c.update_preview_nv12(nv12, stride, frame, content);
         }
         unsafe {
             for slot in 0..CARD_COUNT {

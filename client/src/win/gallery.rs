@@ -32,14 +32,15 @@ impl Card {
     /// NV12 frame (v4: each window is its own stream). This keeps the expensive
     /// full-frame YUV→BGRA conversion off the video path; only the few pixels
     /// needed by visible cards are converted, at the gallery rate.
-    pub fn update_preview_nv12(&mut self, nv12: &[u8], stride: usize, frame: Size) {
-        let whole = Rect {
+    /// The window fills `content` of the frame, from its top left.
+    pub fn update_preview_nv12(&mut self, nv12: &[u8], stride: usize, frame: Size, content: Size) {
+        let window = Rect {
             x: 0,
             y: 0,
-            w: frame.w,
-            h: frame.h,
+            w: content.w,
+            h: content.h,
         };
-        self.update_preview_nv12_sized(whole, nv12, stride, frame, 480, 270);
+        self.update_preview_nv12_sized(window, nv12, stride, frame, 480, 270);
     }
     #[cfg(test)]
     pub fn update_preview_sized(&mut self, pixels: &[u8], display: Size, max_w: u32, max_h: u32) {

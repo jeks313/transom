@@ -36,6 +36,8 @@ pub struct DecodedFrame {
     pub texture: Option<GpuTexture>,
     /// The frame's journey so far, `decoded` stamped.
     pub stamps: FrameStamps,
+    /// The window's part of the picture, from its top left.
+    pub content: (u32, u32),
 }
 
 #[derive(Default)]
@@ -51,6 +53,7 @@ struct EncodedFrame {
     pts_micros: u64,
     reset: bool,
     stamps: FrameStamps,
+    content: (u32, u32),
 }
 impl PendingInput {
     /// Queue one compressed access unit. Returns true when the dependency chain
@@ -118,7 +121,14 @@ pub struct DecoderInput {
     received: Arc<AtomicU64>,
 }
 impl DecoderInput {
-    pub fn submit(&self, data: Vec<u8>, keyframe: bool, pts_micros: u64, stamps: FrameStamps) {
+    pub fn submit(
+        &self,
+        data: Vec<u8>,
+        keyframe: bool,
+        pts_micros: u64,
+        stamps: FrameStamps,
+        content: (u32, u32),
+    ) {
         let n = self.received.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 3 {
             eprintln!("video: access unit {n} ({} bytes, keyframe={keyframe})", data.len());
@@ -133,6 +143,7 @@ impl DecoderInput {
                 pts_micros,
                 reset: false,
                 stamps,
+                content,
             });
         if dropped_chain {
             self.keyframe_request.store(true, Ordering::Release);
@@ -215,6 +226,7 @@ impl DecoderWorker {
                                     decoded: latency::now_micros(),
                                     ..encoded.stamps
                                 };
+                                frame.content = encoded.content;
                                 decoded += 1;
                                 if decoded == 1 {
                                     eprintln!(
@@ -415,6 +427,7 @@ impl Hardware {
             stride: 0,
             texture: Some(GpuTexture(self.out.clone())),
             stamps: FrameStamps::default(),
+            content: (width, height),
         };
         if self.staging_pending {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -784,6 +797,7 @@ fn validate_nv12(
         stride,
         texture: None,
         stamps: FrameStamps::default(),
+        content: (0, 0),
     })
 }
 
@@ -868,6 +882,7 @@ mod tests {
             pts_micros: n,
             reset: false,
             stamps: FrameStamps::default(),
+            content: (0, 0),
         }
     }
     #[test]
@@ -899,6 +914,8 @@ mod tests {
         if p[0] == 0x02 {
             out.extend_from_slice(&p[1..18]);
             out.extend_from_slice(&[0; 24]);
+            out.extend_from_slice(&128u32.to_be_bytes());
+            out.extend_from_slice(&96u32.to_be_bytes());
             out.extend_from_slice(&p[18..]);
         } else {
             out.extend_from_slice(&128u32.to_be_bytes());

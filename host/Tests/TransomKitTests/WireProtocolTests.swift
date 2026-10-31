@@ -234,13 +234,14 @@ struct WireProtocolTests {
             capturedMicros: 9_876_600, encodedMicros: 9_880_000, sentMicros: 9_880_100)
         let encoded = VideoWire.encodeFrame(
             stream: 0x0102_0304_0506_0708, seq: 12_345, ptsMicros: 9_876_543, keyframe: true,
-            timing: timing, data: payload)
+            timing: timing, width: 1568, height: 1420, data: payload)
         #expect(Array(encoded.prefix(9)) == [0x02, 1, 2, 3, 4, 5, 6, 7, 8])
-        #expect(encoded.count == 50 + payload.count)
+        #expect(encoded.count == 58 + payload.count)
+        #expect(Array(encoded[50..<58]) == [0, 0, 0x06, 0x20, 0, 0, 0x05, 0x8C])
         #expect(
             VideoWire.decode(encoded)
                 == .frame(
                     stream: 0x0102_0304_0506_0708, seq: 12_345, ptsMicros: 9_876_543,
-                    keyframe: true, timing: timing, data: payload))
+                    keyframe: true, timing: timing, width: 1568, height: 1420, data: payload))
     }
 }

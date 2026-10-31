@@ -424,11 +424,14 @@ but the payload is not JSON. The first payload byte is a type tag:
 ```
 0x01  config   : stream:u64  width:u32  height:u32  hvcC ...   // HEVC parameter sets (VPS/SPS/PPS)
 0x02  frame    : stream:u64  seq:u64  ptsMicros:u64  flags:u8
-                 capturedMicros:u64  encodedMicros:u64  sentMicros:u64  hevc...   // one access unit
+                 capturedMicros:u64  encodedMicros:u64  sentMicros:u64
+                 width:u32  height:u32  hevc...   // one access unit
                  flags bit0 = keyframe.  integers big-endian.
 ```
 
-`stream` is the id of the window the stream shows (v4).
+`stream` is the id of the window the stream shows (v4). A frame's `width` x
+`height` is the window's part of the picture, from its top left (v5); the rest,
+up to the config's size, is black padding the client does not draw.
 
 **Stage stamps (v3).** `ptsMicros` is when the frame was due on screen (which can
 fall a few ms after the capture had it, so the client starts a frame's total at
@@ -445,13 +448,20 @@ The Mac has one hardware HEVC encoder whose time is set by pixel count (about
 1.45 ms a megapixel on an M5 Pro), so encoding a whole lane cost 23 ms at 5K even
 for a blinking caret. The host still captures each lane as one display (a
 window's menus and popovers stay in its picture) but crops out, with a Metal
-blit, only the windows ScreenCaptureKit reports dirty and encodes those. A window
-that changes size gets a new encoder, and a new `config` before its keyframe.
+blit, only the windows ScreenCaptureKit reports dirty and encodes those.
+
+**A window keeps its encoder through a resize while it fits (v5).** A window that
+shrinks, or grows within its encoder, fills less of the picture, and its frames
+say how much. One that outgrows its encoder gets a new one with room to grow (25%
+on each side, rounded up to 64 pixels, within the lane), and a new `config` before
+its keyframe, so a drag costs a keyframe now and then rather than one per step.
+Once a size has held for 1.5 s, an oversized encoder is replaced by an exact fit,
+since encode time follows the encoder's pixels.
 
 - **A stream's `config` is sent first**, before its first keyframe, again after a
   reconnect, and whenever the window's encoder is replaced. An `hvc1` stream
   carries no inline parameter sets, so the decoder needs the `hvcC` configuration
-  record before it can decode anything. `width`/`height` are the stream's pixels;
+  record before it can decode anything. `width`/`height` are the encoder's picture;
   a decoder may pad its pictures to a block size, and the padding is cropped off.
   A video connection requests a keyframe of every window and a capture refresh,
   including when the display is idle. The server suppresses a stream's deltas

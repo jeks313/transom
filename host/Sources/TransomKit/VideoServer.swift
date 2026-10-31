@@ -11,22 +11,29 @@ import Foundation
 public actor VideoServer {
     /// One encoded frame of a window's stream. `generation` changes when the
     /// window gets a new encoder (a new size), which needs a new `config`.
+    /// `width` x `height` is the encoder's picture; the window fills
+    /// `contentWidth` x `contentHeight` of it from the top left.
     public struct StreamFrame: Sendable {
         public let stream: UInt64
         public let generation: UInt32
         public let width: UInt32
         public let height: UInt32
+        public let contentWidth: UInt32
+        public let contentHeight: UInt32
         /// The encoder's parameter sets, once it has made its first frame.
         public let hvcc: Data?
         public let frame: HEVCEncoder.EncodedFrame
         public init(
-            stream: UInt64, generation: UInt32, width: UInt32, height: UInt32, hvcc: Data?,
+            stream: UInt64, generation: UInt32, width: UInt32, height: UInt32,
+            contentWidth: UInt32? = nil, contentHeight: UInt32? = nil, hvcc: Data?,
             frame: HEVCEncoder.EncodedFrame
         ) {
             self.stream = stream
             self.generation = generation
             self.width = width
             self.height = height
+            self.contentWidth = contentWidth ?? width
+            self.contentHeight = contentHeight ?? height
             self.hvcc = hvcc
             self.frame = frame
         }
@@ -119,7 +126,7 @@ public actor VideoServer {
                     timing: VideoWire.FrameTiming(
                         capturedMicros: frame.capturedMicros, encodedMicros: frame.encodedMicros,
                         sentMicros: HostClock.micros()),
-                    data: frame.data))
+                    width: item.contentWidth, height: item.contentHeight, data: frame.data))
             state.seq += 1
             // A reconnect during the awaits above reset the states; keep the reset.
             if self.active?.id == active.id { streams[item.stream] = state }

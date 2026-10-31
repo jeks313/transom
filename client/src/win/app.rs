@@ -265,6 +265,7 @@ impl App {
                 keyframe,
                 pts_micros,
                 stamps,
+                content,
                 data,
                 ..
             } = event
@@ -275,7 +276,7 @@ impl App {
                 submitted: latency::now_micros(),
                 ..stamps
             };
-            input.submit(data, keyframe, pts_micros, stamps);
+            input.submit(data, keyframe, pts_micros, stamps, content);
             None
         });
         std::thread::spawn(move || {
@@ -666,6 +667,7 @@ impl App {
                 keyframe,
                 pts_micros,
                 stamps,
+                content,
                 ..
             } => {
                 if let Some(decoder) = self.streams.get(&stream).and_then(|l| l.decoder.as_ref()) {
@@ -673,7 +675,7 @@ impl App {
                         submitted: latency::now_micros(),
                         ..stamps
                     };
-                    decoder.input().submit(data, keyframe, pts_micros, stamps);
+                    decoder.input().submit(data, keyframe, pts_micros, stamps, content);
                 }
             }
         }
@@ -740,15 +742,22 @@ impl App {
         let Some(stream) = self.streams.get_mut(&id) else {
             return;
         };
-        if let (Some(frame), Some(source)) = (frame, stream.source.as_ref()) {
+        if let (Some(frame), Some(source)) = (frame, stream.source.as_mut()) {
             match &frame.texture {
                 Some(texture) => source.copy_from(&self.gpu, &texture.0),
                 None => source.update_nv12(&self.gpu, &frame.nv12, frame.stride),
             }
+            source.set_content(frame.content);
             stream.shown = Some(frame.stamps);
             if !frame.nv12.is_empty() {
-                self.dashboard
-                    .update_preview_nv12(id, &frame.nv12, frame.stride, stream.size);
+                let (w, h) = source.content;
+                self.dashboard.update_preview_nv12(
+                    id,
+                    &frame.nv12,
+                    frame.stride,
+                    stream.size,
+                    Size { w, h },
+                );
             }
             stream.video_decoded += 1;
             let first = stream.video_decoded == 1;

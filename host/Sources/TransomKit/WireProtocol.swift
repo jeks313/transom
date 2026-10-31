@@ -80,7 +80,7 @@ public enum ResizePhase: String, Codable, Sendable {
 }
 
 /// The protocol version carried in `hello`. Bump on any breaking wire change.
-public let transomProtocolVersion = 4
+public let transomProtocolVersion = 5
 
 /// The host clock every timestamp on the wire uses: microseconds of
 /// `mach_absolute_time` uptime, the clock ScreenCaptureKit stamps frames with.
@@ -380,9 +380,11 @@ public enum VideoWire {
     /// Every message names its stream: the id of the window it shows (v4).
     public enum Message: Equatable, Sendable {
         case config(stream: UInt64, width: UInt32, height: UInt32, hvcc: Data)
+        /// `width` x `height` is the window's part of the picture, from its top
+        /// left (v5); the rest pads it to the encoder's size.
         case frame(
             stream: UInt64, seq: UInt64, ptsMicros: UInt64, keyframe: Bool, timing: FrameTiming,
-            data: Data)
+            width: UInt32, height: UInt32, data: Data)
     }
 
     /// When a frame passed each host stage, on `HostClock` (v3). `ptsMicros` is
@@ -403,8 +405,9 @@ public enum VideoWire {
 
     /// tag(1) stream(8) width(4) height(4).
     static let configHeaderLength = 17
-    /// tag(1) stream(8) seq(8) pts(8) flags(1) captured(8) encoded(8) sent(8).
-    static let frameHeaderLength = 50
+    /// tag(1) stream(8) seq(8) pts(8) flags(1) captured(8) encoded(8) sent(8)
+    /// width(4) height(4).
+    static let frameHeaderLength = 58
 
     public static func encodeConfig(stream: UInt64, width: UInt32, height: UInt32, hvcc: Data)
         -> Data
@@ -419,7 +422,7 @@ public enum VideoWire {
 
     public static func encodeFrame(
         stream: UInt64, seq: UInt64, ptsMicros: UInt64, keyframe: Bool,
-        timing: FrameTiming = FrameTiming(), data: Data
+        timing: FrameTiming = FrameTiming(), width: UInt32, height: UInt32, data: Data
     ) -> Data {
         var out = Data([0x02])
         out.reserveCapacity(frameHeaderLength + data.count)
@@ -430,6 +433,8 @@ public enum VideoWire {
         out.append(contentsOf: bigEndianBytes(timing.capturedMicros))
         out.append(contentsOf: bigEndianBytes(timing.encodedMicros))
         out.append(contentsOf: bigEndianBytes(timing.sentMicros))
+        out.append(contentsOf: bigEndianBytes(UInt64(width)).suffix(4))
+        out.append(contentsOf: bigEndianBytes(UInt64(height)).suffix(4))
         out.append(data)
         return out
     }
@@ -452,6 +457,7 @@ public enum VideoWire {
             return .frame(
                 stream: stream, seq: beUInt64(bytes, 9), ptsMicros: beUInt64(bytes, 17),
                 keyframe: bytes[25] != 0, timing: timing,
+                width: beUInt32(bytes, 50), height: beUInt32(bytes, 54),
                 data: Data(bytes[frameHeaderLength...]))
         default:
             return nil

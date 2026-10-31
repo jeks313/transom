@@ -456,13 +456,13 @@ mod tests {
     #[test]
     fn decodes_hello() {
         let msg = ServerMessage::decode(
-            br#"{"type":"hello","protocol":4,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
+            br#"{"type":"hello","protocol":5,"lanes":[{"lane":0,"vdsSize":{"w":5120,"h":2880}},{"lane":1,"vdsSize":{"w":4096,"h":2160}}]}"#,
         )
         .unwrap();
         assert_eq!(
             msg,
             ServerMessage::Hello {
-                protocol: 4,
+                protocol: 5,
                 lanes: vec![
                     Lane {
                         lane: 0,
