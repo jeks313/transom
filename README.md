@@ -18,6 +18,12 @@ does not otherwise exist.
 
 ## This fork (jeks313/transom)
 
+> [!WARNING]
+> **Disclaimer.** Everything in this fork was written with Claude Code over a
+> couple of days, strictly for personal use, to see what was possible. No code
+> review has been done: no human has reviewed any of this code. Do not rely on
+> it, and do not run it anywhere it matters.
+
 A fork of [aydinmrnv/transom](https://github.com/aydinmrnv/transom) at v0.5.0,
 tuned for low latency between an M5 Pro Mac (macOS 26.7) and a Windows 11 PC
 over Tailscale. Everything below was tested through `transom-host serve` and the
