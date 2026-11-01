@@ -16,6 +16,88 @@ does not otherwise exist.
 > protocol (its GPU/decode runtime needs a real Windows box; see
 > [`client/README.md`](client/README.md)).
 
+## This fork (jeks313/transom)
+
+A fork of [aydinmrnv/transom](https://github.com/aydinmrnv/transom) at v0.5.0,
+tuned for low latency between an M5 Pro Mac (macOS 26.7) and a Windows 11 PC
+over Tailscale. Everything below was tested through `transom-host serve` and the
+Windows client; the Transom Host app was not re-tested. Where this section and
+the rest of the README disagree, this section is current: the host makes its
+own virtual displays (no BetterDisplay), encodes each window separately in HEVC
+4:2:0 8-bit, and speaks protocol v5.
+
+### Video pipeline and latency
+
+| Change | Effect (measured) |
+| --- | --- |
+| **One encoder per window** (protocol v4). Each lane is still captured as one display, so menus and popovers stay in their window's picture, but only the windows ScreenCaptureKit reports dirty are cropped (a Metal blit) into encoders of their own size. | Safari window capture to present: 11 ms p50, 21 ms p95 (was 79 / 210 ms with a whole 5K lane) |
+| **GPU decode on Windows.** Media Foundation decodes into the renderer's D3D11 device, and pictures are copied GPU to GPU into a real NV12 texture. | 5K decode 18.8 ms to 0.3 ms |
+| **Frames are decoded as they arrive** on the video thread, and a decoded frame wakes the message loop to present it at once. | Queue 8 ms to 0, display 12 to 4 ms |
+| **No periodic keyframes or endless idle refresh.** Keyframes are a 60 s backstop, the client asks for one when it needs it, and an idle lane is refreshed once. | Real frames no longer queue behind a forced 250 KB keyframe |
+| **App Nap is kept off** while sharing. | Encode time had doubled (8 to 17 ms) a minute after launch |
+| **At most two frames in flight** per window encoder; the newest waits and replaces older waiting ones. | A 7 MP window at 120 fps no longer falls 42 ms behind |
+| **120 Hz virtual displays.** Displays refresh at max(60, `--fps`), and `--fps` defaults to 120. | A small window arrives at 107 fps instead of 57 |
+| **Encoder kept through a resize** (protocol v5). A window that shrinks or grows within its encoder keeps it, drawn in the top left with the rest black, and each frame carries the window's size. A window that outgrows its encoder gets one 25% larger; after 1.5 s at one size an oversized encoder is replaced by an exact fit. | A drag costs a keyframe now and then instead of one per step |
+| **The old picture stays up** while a restarted window stream waits for its first keyframe. | No placeholder hatch after a resize |
+| **Mouse moves are throttled to 120 Hz** on the host. | A 1000 Hz mouse no longer stalls Chrome's event queue for seconds |
+| **Red/blue swap fixed** in the NV12 to RGB shader. | Colours are right |
+
+**Latency measurement.** Every frame carries capture, encode and send stamps
+on the host clock (protocol v3), and ping/pong maps that clock onto the
+client's. The client logs p50/p95 for each stage to
+`%LOCALAPPDATA%\Transom\latency.log` and shows the total in the status line.
+Keys and clicks are matched to the first frame of their window captured after
+they could have reached the Mac, which gives an `input:` line with input to
+capture and input to screen. Typing into a test window over Wi-Fi measured
+**43 ms p50, 82 to 108 ms p95** from key to screen; the p95 is the Mac's Wi-Fi.
+
+### Sharing several apps
+
+- **The host makes its own virtual displays.** `serve <app>` without a display
+  id starts `transom-display`, a child holding a 2x `CGVirtualDisplay` (Sill's
+  `VirtualDisplay.swift`, vendored, Apache-2.0) to the right of the other
+  displays, never main. It keeps the Mac out of display sleep and goes away when
+  `serve` stops. `serve` warns when Stage Manager is on.
+- **Lanes** (protocol v2). `serve --lane APP[,APP...][=WxH]` puts more apps on
+  displays of their own, each with its own capture, in the same process and over
+  the same two connections.
+- **System prompts.** Touch ID, password, admin-approval (including BeyondTrust
+  Privilege Management) and similar prompts appear on the Mac's own screen,
+  where the client cannot reach them. `serve` moves them onto a prompt display
+  and the client opens them at once (`--no-prompts` to skip).
+- **Tiny helper windows are hidden.** Untitled windows under 100x60 pt that are
+  not the app's own (Safari and Chrome keep 66x20 pt ones) are not shared.
+- **ScreenCaptureKit start is bounded:** 5 s per attempt, up to 4 tries.
+
+### Using the apps
+
+- **Native menu bar.** The host reads each shared app's menu bar through
+  Accessibility and the client shows it as a Win32 menu bar on that app's
+  windows. A pick types the item's shortcut, or presses it through
+  Accessibility when it has none. Alt and F10 do not open it, since Alt is
+  Option on the Mac.
+- **Clipboard.** Plain text syncs both ways over the control channel: the host
+  checks the Mac pasteboard every 250 ms, and the client sends what is copied
+  on Windows plus its clipboard on connect. Neither side sends back what it
+  just wrote, text over 1 MiB is skipped, and line endings are converted.
+  Everything copied on Windows reaches the Mac while connected.
+
+### Network
+
+- `serve --host` also accepts the CGNAT range `100.64.0.0/10`, so the host can
+  listen on a Tailscale address and a client on the same tailnet connects
+  directly. Tailscale encrypts the link; Transom itself still does not.
+
+### Headless client
+
+`transom-client connect <host> --video` prints per-stage latency. It also has:
+
+| Option | Does |
+| --- | --- |
+| `--type-every <ms>` | types `--type` one key at a time and reports input to screen |
+| `--window <id>` | picks the window `--type` types into |
+| `--copy <text>` | puts text on the Mac's clipboard |
+
 ## Quick connect
 
 Start sharing in Transom Host on the Mac, then open Transom on Windows and
